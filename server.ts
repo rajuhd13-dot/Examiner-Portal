@@ -265,6 +265,15 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
+app.get("/api/refresh", async (req, res) => {
+  const tpin = req.query.tpin as string;
+  if (!tpin) return res.status(400).json({ ok: false, message: "TPIN required" });
+  
+  console.log(`[Cache] Refreshing cache for TPIN: ${tpin}`);
+  await updateServerCache('bulk'); // Refresh full cache to ensure consistency
+  res.json({ ok: true, message: `Cache refreshed for ${tpin}` });
+});
+
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({

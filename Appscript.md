@@ -289,3 +289,16 @@ function fmtBatch_(v) {
   v = String(v||'').trim();
   return /^\d{2}$/.test(v) ? '20' + v : v;
 }
+
+function onEdit(e) {
+  var sheet = e.source.getActiveSheet();
+  if (sheet.getName() === CONFIG.SHEET_NAME) {
+     var tpin = sheet.getRange(e.range.getRow(), COL.TPIN).getValue();
+     // Signal Node.js server to refresh cache for this TPIN
+     // Note: The Node.js server needs a route /api/refresh.
+     UrlFetchApp.fetch('https://ais-dev-3kjxsqk4ykskyku364hsua-192410877328.asia-southeast1.run.app/api/refresh?tpin=' + tpin, {
+       'method': 'get',
+       'muteHttpExceptions': true
+     });
+  }
+}

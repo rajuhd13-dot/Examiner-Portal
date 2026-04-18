@@ -228,18 +228,13 @@ export async function updateClientCache(mode: 'bulk' | 'realtime' = 'realtime') 
   try {
     const freshIndex = new Map();
 
-    const fetchWithRetry = async (url: string, options: any, retries = 2): Promise<Response> => {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 15000); // 15s timeout
-      
+    const fetchWithRetry = async (url: string, options: any, retries = 3): Promise<Response> => {
       try {
-        const response = await fetch(url, { ...options, signal: controller.signal });
-        clearTimeout(timeoutId);
+        const response = await fetch(url, options);
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         return response;
-      } catch (err: any) {
-        clearTimeout(timeoutId);
-        if (retries > 0 && err.name !== 'AbortError') {
+      } catch (err) {
+        if (retries > 0) {
           console.warn(`[Sync] Network issue, retrying in 1s... (${retries} left)`);
           await new Promise(r => setTimeout(r, 1000));
           return fetchWithRetry(url, options, retries - 1);
@@ -273,16 +268,6 @@ export async function updateClientCache(mode: 'bulk' | 'realtime' = 'realtime') 
 
     const fetchRealtime = async () => {
       const response = await fetchWithRetry(`${APPSCRIPT_URL}?action=sync&cb=${Date.now()}`, { referrerPolicy: 'no-referrer' });
-      
-      const contentType = response.headers.get("content-type");
-      if (contentType && !contentType.includes("application/json")) {
-        const text = await response.text();
-        if (text.includes("<!DOCTYPE html>")) {
-          console.error("[Sync] Apps Script returned HTML instead of JSON. Check deployment settings (Who has access: Anyone).");
-          return false;
-        }
-      }
-
       const result = await response.json();
       if (!result || !result.ok || !Array.isArray(result.data)) return false;
 
@@ -359,24 +344,8 @@ export async function searchExaminerAPI(query: string, forceLive = false) {
   }
 
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 20000); // 20s timeout for search
-
-    const response = await fetch(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}`, {
-      referrerPolicy: 'no-referrer',
-      signal: controller.signal
-    });
-    
-    const contentType = response.headers.get("content-type");
-    if (contentType && !contentType.includes("application/json")) {
-      const text = await response.text();
-      if (text.includes("<!DOCTYPE html>")) {
-        throw new Error("Apps Script returned HTML. Check if it is deployed as 'Anyone' (not 'Anyone with Google Account').");
-      }
-    }
-
+    const response = await fetch(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}`);
     const result = await response.json();
-    clearTimeout(timeoutId);
 
     if (result && result.ok) {
       // Result from AppScript is already mapped by server
@@ -385,10 +354,6 @@ export async function searchExaminerAPI(query: string, forceLive = false) {
     }
     return { ok: false, message: result?.message || "No examiner found." };
   } catch (error: any) {
-    if (error.name === 'AbortError') {
-      return { ok: false, message: "Search timed out. Please try again." };
-    }
-    console.error('Search internal error:', error);
-    return { ok: false, message: "Search failed. Check your internet or AppScript." };
+    return { ok: false, message: "Search failed. Check your connection." };
   }
 }
