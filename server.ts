@@ -5,6 +5,8 @@ import axios from "axios";
 import Papa from "papaparse";
 
 const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 const PORT = 3000;
 
 const SPREADSHEET_ID = '1R_O4llA1K43Y97GAgkK97WMvWbqg-tftz_FXpcUSZPU';
@@ -203,23 +205,29 @@ async function updateServerCache(mode: 'bulk' | 'realtime' = 'realtime') {
 updateServerCache('bulk');
 
 // POWER SCHEDULER (Bangladesh Time UTC+6)
+// With 80,000+ rows, we do not poll Google Sheets Apps Script every 2.5s (it crashes Apps Script and times out).
+// Instead, we use instant event-driven refresh webhook pushes from Google Sheets, 
+// and a 15-minute scheduled bulk sync during work hours as a backup.
 setInterval(() => {
   const now = new Date();
   // Get hour in Bangladesh Time (UTC+6)
   const bdHour = (now.getUTCHours() + 6) % 24;
   
-  // 1. Work Hours (8 AM - 10 PM): Aggressive 2.5s Sync for 1-3s update target
+  // 1. Work Hours (8 AM - 10 PM): Backup CSV Sync every 15 mins
   if (bdHour >= 8 && bdHour < 22) {
-    updateServerCache('realtime');
+    if (Date.now() - lastSyncTime > 15 * 60 * 1000) {
+      console.log(`[Scheduler] 15-minute scheduled backup safety Bulk Sync...`);
+      updateServerCache('bulk');
+    }
   } 
-  // 2. Nightly Maintenance (11 PM - 6 AM): Deep Bulk Refresh
-  else if (bdHour >= 23 || bdHour < 6) {
-    // Only refresh once every 30 mins at night to save resources
-    if (Date.now() - lastSyncTime > 30 * 60 * 1000) {
+  // 2. Nightly Maintenance (11 PM - 6 AM): Deep Bulk Refresh every 45 mins
+  else {
+    if (Date.now() - lastSyncTime > 45 * 60 * 1000) {
+      console.log(`[Scheduler] Nightly deep scheduled backup Bulk Sync...`);
       updateServerCache('bulk');
     }
   }
-}, 2500);
+}, 30000); // Check every 30 seconds
 
 app.get("/api/search", async (req, res) => {
   const query = req.query.q as string;
@@ -265,13 +273,60 @@ app.get("/api/search", async (req, res) => {
   }
 });
 
+// GET refresh endpoint: Fallback that fetches only the single edited record from Apps Script
 app.get("/api/refresh", async (req, res) => {
   const tpin = req.query.tpin as string;
   if (!tpin) return res.status(400).json({ ok: false, message: "TPIN required" });
   
-  console.log(`[Cache] Refreshing cache for TPIN: ${tpin}`);
-  await updateServerCache('bulk'); // Refresh full cache to ensure consistency
-  res.json({ ok: true, message: `Cache refreshed for ${tpin}` });
+  console.log(`[Cache] Light GET Refresh via Apps Script lookup for TPIN: ${tpin}`);
+  try {
+    const response = await axios.get(`${APPSCRIPT_URL}?q=${encodeURIComponent(tpin)}`, { timeout: 15000 });
+    const data = response.data;
+    if (data && data.ok && data.data) {
+      const mappedData = data.data;
+      const t = normalizeSearchKey(mappedData.quick.tpin);
+      const m1 = normalizeSearchKey(mappedData.quick.mobile1);
+      const m2 = normalizeSearchKey(mappedData.quick.mobile2);
+      
+      if (t) cachedIndex.set(t, mappedData);
+      if (m1) cachedIndex.set(m1, mappedData);
+      if (m2) cachedIndex.set(m2, mappedData);
+      
+      console.log(`[Cache] Successfully refreshed cache for TPIN: ${tpin}`);
+      return res.json({ ok: true, message: `Cache refreshed for TPIN ${tpin}` });
+    } else {
+      console.warn(`[Cache] Apps Script lookup returned no data or error for TPIN ${tpin}:`, data?.message);
+      return res.status(404).json({ ok: false, message: data?.message || "TPIN not found in sheet" });
+    }
+  } catch (error: any) {
+    console.error(`[Cache] Failed to refresh TPIN ${tpin}:`, error.message);
+    return res.status(500).json({ ok: false, message: `Error refreshing TPIN: ${error.message}` });
+  }
+});
+
+// POST refresh endpoint: Triggered instantly by Google Sheet installable On Edit trigger
+app.post("/api/refresh", (req, res) => {
+  const { tpin, data } = req.body;
+  if (!tpin || !data) {
+    return res.status(400).json({ ok: false, message: "tpin and data are required in the request body" });
+  }
+  
+  console.log(`[Cache] Instant POST Refresh push from Google Sheet for TPIN: ${tpin}`);
+  try {
+    const t = normalizeSearchKey(tpin);
+    const m1 = normalizeSearchKey(data.quick.mobile1);
+    const m2 = normalizeSearchKey(data.quick.mobile2);
+    
+    if (t) cachedIndex.set(t, data);
+    if (m1) cachedIndex.set(m1, data);
+    if (m2) cachedIndex.set(m2, data);
+    
+    console.log(`[Cache] Cache instantly updated for TPIN: ${tpin}`);
+    return res.json({ ok: true, message: `Cache updated instantly for TPIN ${tpin}` });
+  } catch (error: any) {
+    console.error(`[Cache] Error processing POST refresh payload for TPIN ${tpin}:`, error.message);
+    return res.status(500).json({ ok: false, message: error.message });
+  }
 });
 
 async function startServer() {

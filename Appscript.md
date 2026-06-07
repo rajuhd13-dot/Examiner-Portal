@@ -290,15 +290,95 @@ function fmtBatch_(v) {
   return /^\d{2}$/.test(v) ? '20' + v : v;
 }
 
+/*************************************************
+ * REAL-TIME EVENT-DRIVEN TRIGGER
+ * To make this work instantly with authorization:
+ * 1. Open Apps Script Editor
+ * 2. Click is "Triggers" (alarm icon in left sidebar)
+ * 3. Click "Add Trigger"
+ * 4. Choose "handleSheetEditTrigger" as the function to run
+ * 5. Choose "From spreadsheet" as event source
+ * 6. Choose "On edit" as event type
+ * 7. Click Save and authorize permissions.
+ *************************************************/
+/*************************************************
+ * REAL-TIME EVENT-DRIVEN TRIGGER SETUP Helper
+ * To automatically set up your trigger, bypass dropdown limitations of standalone project:
+ * 1. Open Apps Script Editor
+ * 2. Select "setupRealtimeTrigger" from the top dropdown (next to Run/Debug buttons)
+ * 3. Click "Run" or "► Run"
+ * 4. Authorize the permissions popup.
+ * Done! The trigger will be created programmatically for your spreadsheet.
+ *************************************************/
+function setupRealtimeTrigger() {
+  var triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === 'handleSheetEditTrigger') {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  
+  // Create the trigger programmatically bypassing UI lack of "From spreadsheet" option
+  ScriptApp.newTrigger('handleSheetEditTrigger')
+    .forSpreadsheet(CONFIG.SPREADSHEET_ID)
+    .onEdit()
+    .create();
+    
+  console.log('Success! Real-time edit trigger successfully created and linked to spreadsheet: ' + CONFIG.SPREADSHEET_ID);
+}
+
+function handleSheetEditTrigger(e) {
+  try {
+    var range = e.range;
+    var sheet = range.getSheet();
+    if (sheet.getName() !== CONFIG.SHEET_NAME) return;
+    
+    var rowIdx = range.getRow();
+    if (rowIdx < CONFIG.DATA_START_ROW) return;
+    
+    // Fetch only this edited row (1 row, 96 columns) which is extremely fast and lightweight!
+    var rowData = sheet.getRange(rowIdx, 1, 1, CONFIG.TOTAL_COLS).getDisplayValues()[0];
+    var mappedData = mapRow_(rowData);
+    var tpin = mappedData.quick.tpin;
+    
+    if (!tpin) return;
+    
+    var payload = {
+      tpin: tpin,
+      data: mappedData
+    };
+    
+    var options = {
+      'method': 'post',
+      'contentType': 'application/json',
+      'payload': JSON.stringify(payload),
+      'muteHttpExceptions': true
+    };
+    
+    // Pushes update instantly to the server cache (Takes < 50ms!)
+    UrlFetchApp.fetch('https://ais-dev-3kjxsqk4ykskyku364hsua-192410877328.asia-southeast1.run.app/api/refresh', options);
+    UrlFetchApp.fetch('https://ais-pre-3kjxsqk4ykskyku364hsua-192410877328.asia-southeast1.run.app/api/refresh', options);
+  } catch (err) {
+    console.log("Error in handleSheetEditTrigger: " + err.message);
+  }
+}
+
+// Simple fallback trigger (runs without authorization, might fail due to UrlFetch permission restrictions)
 function onEdit(e) {
-  var sheet = e.source.getActiveSheet();
-  if (sheet.getName() === CONFIG.SHEET_NAME) {
-     var tpin = sheet.getRange(e.range.getRow(), COL.TPIN).getValue();
-     // Signal Node.js server to refresh cache for this TPIN
-     // Note: The Node.js server needs a route /api/refresh.
-     UrlFetchApp.fetch('https://ais-dev-3kjxsqk4ykskyku364hsua-192410877328.asia-southeast1.run.app/api/refresh?tpin=' + tpin, {
-       'method': 'get',
-       'muteHttpExceptions': true
-     });
+  try {
+    var sheet = e.source.getActiveSheet();
+    if (sheet.getName() === CONFIG.SHEET_NAME) {
+       var tpin = sheet.getRange(e.range.getRow(), COL.TPIN).getValue();
+       UrlFetchApp.fetch('https://ais-dev-3kjxsqk4ykskyku364hsua-192410877328.asia-southeast1.run.app/api/refresh?tpin=' + tpin, {
+         'method': 'get',
+         'muteHttpExceptions': true
+       });
+       UrlFetchApp.fetch('https://ais-pre-3kjxsqk4ykskyku364hsua-192410877328.asia-southeast1.run.app/api/refresh?tpin=' + tpin, {
+         'method': 'get',
+         'muteHttpExceptions': true
+       });
+    }
+  } catch(err) {
+    // Simple triggering lacks UrlFetch permissions, this catch is expected.
   }
 }
