@@ -329,7 +329,7 @@ export async function startBackgroundSync() {
   }, 10000); // 10s sync for live updates
 }
 
-export async function searchExaminerAPI(query: string, forceLive = false) {
+export async function searchExaminerAPI(query: string, forceLive = false, signal?: AbortSignal) {
   if (!query) {
     return { ok: false, message: "Search value is empty." };
   }
@@ -343,8 +343,28 @@ export async function searchExaminerAPI(query: string, forceLive = false) {
     return { ok: true, data: mapped };
   }
 
+  // Create localized controller to automatically timeout after 5 seconds to prevent endless spinning
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+  
+  const onAbort = () => {
+    controller.abort();
+    clearTimeout(timeoutId);
+  };
+
+  if (signal) {
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener('abort', onAbort);
+    }
+  }
+
   try {
-    const response = await fetch(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}`);
+    const response = await fetch(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}`, { 
+      signal: controller.signal,
+      referrerPolicy: 'no-referrer'
+    });
     const result = await response.json();
 
     if (result && result.ok) {
@@ -354,6 +374,14 @@ export async function searchExaminerAPI(query: string, forceLive = false) {
     }
     return { ok: false, message: result?.message || "No examiner found." };
   } catch (error: any) {
-    return { ok: false, message: "Search failed. Check your connection." };
+    if (signal && signal.aborted) {
+      return { ok: false, message: "Search cancelled." };
+    }
+    return { ok: false, message: "No examiner found." };
+  } finally {
+    clearTimeout(timeoutId);
+    if (signal) {
+      signal.removeEventListener('abort', onAbort);
+    }
   }
 }

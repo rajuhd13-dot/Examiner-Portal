@@ -83,16 +83,39 @@ export default function App() {
   const [data, setData] = useState<ExaminerData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
 
   // Auto-focus search on load and Start Sync
   useEffect(() => {
     searchInputRef.current?.focus();
     // Start background sync immediately
     startBackgroundSync().catch(() => {});
+
+    // Clean up any pending controllers on unmount
+    return () => {
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+      }
+    };
   }, []);
+
+  const handleCancelSearch = (e?: React.MouseEvent | React.FormEvent) => {
+    if (e) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+    setLoading(false);
+    setError("Search cancelled.");
+  };
 
   const handleSearch = async (e?: React.FormEvent) => {
     e?.preventDefault();
+    if (loading) return; // Block double submission while searching
+
     const searchKey = query.trim();
     if (!searchKey) return;
 
@@ -101,12 +124,23 @@ export default function App() {
       return;
     }
 
+    // Abort any active searches before triggering new one
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setError(null);
     setLoading(true);
 
     try {
-      // searchExaminerAPI handles the 0.1s cache internally
-      const result = await searchExaminerAPI(searchKey);
+      // searchExaminerAPI handles the 0.1s cache internally, now supports AbortSignal & 5s timeout
+      const result = await searchExaminerAPI(searchKey, false, controller.signal);
+
+      if (controller.signal.aborted) {
+        return;
+      }
 
       if (result.ok) {
         setData(result.data);
@@ -118,10 +152,21 @@ export default function App() {
         }
       }
     } catch (err: any) {
-      console.error("Search error:", err);
-      setError(err.message || "Server error occurred.");
+      if (controller.signal.aborted) {
+        return;
+      }
+      if (err.name === "AbortError") {
+        console.log("Search request aborted.");
+      } else {
+        console.error("Search error:", err);
+        setError(err.message || "Server error occurred.");
+      }
     } finally {
-      setLoading(false);
+      // Direct comparison to check if this was our current active controller
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+        setLoading(false);
+      }
     }
   };
 
@@ -165,14 +210,39 @@ export default function App() {
                     value={query}
                     onChange={(e) => setQuery(e.target.value)}
                   />
+                  {query && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        setQuery("");
+                        if (loading) handleCancelSearch(e);
+                      }}
+                      className="text-slate-400 hover:text-red-500 font-bold p-1.5 rounded-full hover:bg-slate-100 transition-colors cursor-pointer"
+                      title={loading ? "Stop search" : "Clear input"}
+                    >
+                      <XCircle className="w-5 h-5" />
+                    </button>
+                  )}
                 </div>
-                <button
-                  type="submit"
-                  disabled={loading}
-                  className="mt-2 md:mt-0 md:ml-2 w-full md:w-auto h-12 px-8 bg-[#4466ff] hover:bg-[#3355ee] text-white font-bold rounded-[16px] transition-all shadow-md flex items-center justify-center gap-2 active:scale-[0.98]"
-                >
-                  {loading ? <Loader2 className="w-4 h-4 animate-spin" /> : "Search"}
-                </button>
+                {loading ? (
+                  <button
+                    type="button"
+                    onClick={(e) => handleCancelSearch(e)}
+                    className="mt-2 md:mt-0 md:ml-2 w-full md:w-auto h-12 px-6 bg-red-600 hover:bg-red-700 text-white font-bold rounded-[16px] transition-all shadow-md flex items-center justify-center gap-2 active:scale-[0.98] animate-pulse cursor-pointer"
+                  >
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    <span className="text-sm">Stop</span>
+                  </button>
+                ) : (
+                  <button
+                    type="submit"
+                    className="mt-2 md:mt-0 md:ml-2 w-full md:w-auto h-12 px-8 bg-[#4466ff] hover:bg-[#3355ee] text-white font-bold rounded-[16px] transition-all shadow-md flex items-center justify-center gap-2 active:scale-[0.98]"
+                  >
+                    Search
+                  </button>
+                )}
               </div>
             </form>
           </div>
