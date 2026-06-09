@@ -178,7 +178,8 @@ export default function App() {
       if (d.startsWith("0") && d.length === 11) formatted = "88" + d;
       else if (d.startsWith("1") && d.length === 10) formatted = "880" + d;
     }
-    return `https://wa.me/${formatted}`;
+    const message = "Greetings, I am contacting you on behalf of the Exam Script Evaluation Department.";
+    return `https://wa.me/${formatted}?text=${encodeURIComponent(message)}`;
   };
 
   return (
