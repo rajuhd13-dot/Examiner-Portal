@@ -341,6 +341,50 @@ export async function startBackgroundSync() {
   }, 10000); // 10s sync for live updates
 }
 
+async function fetchDirectAppsScript(query: string, parentSignal?: AbortSignal) {
+  const searchKey = normalizeSearchKey(query);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout for reliability
+
+  const onAbort = () => {
+    controller.abort();
+    clearTimeout(timeoutId);
+  };
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      onAbort();
+    } else {
+      parentSignal.addEventListener('abort', onAbort);
+    }
+  }
+
+  try {
+    const response = await fetch(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}`, { 
+      signal: controller.signal,
+      referrerPolicy: 'no-referrer'
+    });
+    const result = await response.json();
+
+    if (result && result.ok) {
+      // Store in memory cache for instant future lookup
+      cachedIndex.set(searchKey, result.data);
+      return { ok: true, data: result.data };
+    }
+    return { ok: false, message: result?.message || "No examiner found." };
+  } catch (error: any) {
+    if (parentSignal && parentSignal.aborted) {
+      return { ok: false, message: "Search cancelled." };
+    }
+    return { ok: false, message: "No examiner found." };
+  } finally {
+    clearTimeout(timeoutId);
+    if (parentSignal) {
+      parentSignal.removeEventListener('abort', onAbort);
+    }
+  }
+}
+
 export async function searchExaminerAPI(query: string, forceLive = false, signal?: AbortSignal) {
   if (!query) {
     return { ok: false, message: "Search value is empty." };
@@ -351,13 +395,31 @@ export async function searchExaminerAPI(query: string, forceLive = false, signal
   // 1. Ensure initial load from local IndexedDB cache is done
   await initialLoadPromise;
 
-  // 2. If local cache is still empty, wait for the background sync to finish (or force a bulk sync)
+  // 2. If local cache is still empty, run a fast direct lookup immediately
+  // and trigger the background sync so it builds silently without blocking the user.
   if (cachedIndex.size === 0) {
-    console.log("[Search] Cache is empty. Waiting for active sync...");
+    console.log("[Search] Cache is empty. Running rapid direct lookup first...");
+    
+    // Trigger bulk sync in background silently (do not await it here!)
+    if (!activeSyncPromise) {
+      updateClientCache('bulk').catch(err => console.error('[Sync] Background sync error:', err));
+    }
+    
+    // Run instant direct single query lookup (very fast, < 300ms)
+    const directResult = await fetchDirectAppsScript(query, signal);
+    if (directResult.ok) {
+      return directResult;
+    }
+    
+    // If direct lookup didn't find anything, we can still wait for the active background sync to complete as fallback
     if (activeSyncPromise) {
+      console.log("[Search] Direct lookup not found, waiting for active background sync...");
       await activeSyncPromise;
-    } else {
-      await updateClientCache('bulk');
+      if (cachedIndex.has(searchKey)) {
+        const rawData = cachedIndex.get(searchKey);
+        const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
+        return { ok: true, data: mapped };
+      }
     }
   }
 
@@ -382,45 +444,6 @@ export async function searchExaminerAPI(query: string, forceLive = false, signal
     }
   }
 
-  // 5. If still not found, fallback to the direct Apps Script lookup endpoint with 10 seconds timeout for reliability
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout for fallback search to prevent premature timeouts
-  
-  const onAbort = () => {
-    controller.abort();
-    clearTimeout(timeoutId);
-  };
-
-  if (signal) {
-    if (signal.aborted) {
-      onAbort();
-    } else {
-      signal.addEventListener('abort', onAbort);
-    }
-  }
-
-  try {
-    const response = await fetch(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}`, { 
-      signal: controller.signal,
-      referrerPolicy: 'no-referrer'
-    });
-    const result = await response.json();
-
-    if (result && result.ok) {
-      // Result from AppScript is already mapped by server
-      cachedIndex.set(searchKey, result.data);
-      return { ok: true, data: result.data };
-    }
-    return { ok: false, message: result?.message || "No examiner found." };
-  } catch (error: any) {
-    if (signal && signal.aborted) {
-      return { ok: false, message: "Search cancelled." };
-    }
-    return { ok: false, message: "No examiner found." };
-  } finally {
-    clearTimeout(timeoutId);
-    if (signal) {
-      signal.removeEventListener('abort', onAbort);
-    }
-  }
+  // 5. If still not found, fallback to direct Apps Script lookup
+  return await fetchDirectAppsScript(query, signal);
 }
