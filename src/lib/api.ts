@@ -140,6 +140,7 @@ async function getFromDB(key: string) {
 let cachedIndex: Map<string, any[]> = new Map(); // Stores RAW row arrays for speed
 let isFetching = false;
 let lastSyncTime = 0;
+let activeSyncPromise: Promise<void> | null = null;
 
 async function loadPersistentCache() {
   const saved = await getFromDB('full_index') as any[][];
@@ -170,7 +171,7 @@ async function savePersistentCache() {
 }
 
 // Initial Fast Load
-loadPersistentCache();
+const initialLoadPromise = loadPersistentCache();
 
 function formatMobile(v: any) {
   const s = String(v || '').trim();
@@ -222,93 +223,104 @@ function mapRawRow(row: any[]) {
 }
 
 export async function updateClientCache(mode: 'bulk' | 'realtime' = 'realtime') {
-  if (isFetching) return;
+  if (isFetching) {
+    if (activeSyncPromise) {
+      await activeSyncPromise;
+    }
+    return;
+  }
   isFetching = true;
 
-  try {
-    const freshIndex = new Map();
+  activeSyncPromise = (async () => {
+    try {
+      const freshIndex = new Map();
 
-    const fetchWithRetry = async (url: string, options: any, retries = 3): Promise<Response> => {
-      try {
-        const response = await fetch(url, options);
-        if (!response.ok) throw new Error(`HTTP ${response.status}`);
-        return response;
-      } catch (err) {
-        if (retries > 0) {
-          console.warn(`[Sync] Network issue, retrying in 1s... (${retries} left)`);
-          await new Promise(r => setTimeout(r, 1000));
-          return fetchWithRetry(url, options, retries - 1);
+      const fetchWithRetry = async (url: string, options: any, retries = 3): Promise<Response> => {
+        try {
+          const response = await fetch(url, options);
+          if (!response.ok) throw new Error(`HTTP ${response.status}`);
+          return response;
+        } catch (err) {
+          if (retries > 0) {
+            console.warn(`[Sync] Network issue, retrying in 1s... (${retries} left)`);
+            await new Promise(r => setTimeout(r, 1000));
+            return fetchWithRetry(url, options, retries - 1);
+          }
+          throw err;
         }
-        throw err;
+      };
+
+      const fetchBulk = async () => {
+        const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=csv&gid=0`;
+        const response = await fetchWithRetry(url, { referrerPolicy: 'no-referrer' });
+        const textData = await response.text();
+        if (textData.includes('<!DOCTYPE html>') || textData.length < 500) return false;
+        
+        const results = Papa.parse(textData, { header: false, skipEmptyLines: true });
+        const rows = results.data as any[][];
+        if (rows.length <= 1) return false;
+
+        // Skip header, store raw data directly
+        for (let i = 1; i < rows.length; i++) {
+          const row = rows[i];
+          const t = normalizeSearchKey(row[COL.TPIN - 1]);
+          const m1 = normalizeSearchKey(row[COL.MOBILE_1 - 1]);
+          const m2 = normalizeSearchKey(row[COL.MOBILE_2 - 1]);
+          if (t) freshIndex.set(t, row);
+          if (m1) freshIndex.set(m1, row);
+          if (m2) freshIndex.set(m2, row);
+        }
+        return true;
+      };
+
+      const fetchRealtime = async () => {
+        const response = await fetchWithRetry(`${APPSCRIPT_URL}?action=sync&cb=${Date.now()}`, { referrerPolicy: 'no-referrer' });
+        const result = await response.json();
+        if (!result || !result.ok || !Array.isArray(result.data)) return false;
+
+        for (const rawRow of result.data) {
+          const t = normalizeSearchKey(rawRow[COL.TPIN - 1]);
+          const m1 = normalizeSearchKey(rawRow[COL.MOBILE_1 - 1]);
+          const m2 = normalizeSearchKey(rawRow[COL.MOBILE_2 - 1]);
+          if (t) freshIndex.set(t, rawRow);
+          if (m1) freshIndex.set(m1, rawRow);
+          if (m2) freshIndex.set(m2, rawRow);
+        }
+        return true;
+      };
+
+      let success = false;
+      if (mode === 'bulk') {
+        try { 
+          success = await fetchBulk(); 
+          console.log('[Sync] Bulk Load: OK');
+        } catch (e) { 
+          console.warn('[Sync] Bulk failed, using Realtime fallback...');
+          success = await fetchRealtime(); 
+        }
+      } else {
+        success = await fetchRealtime();
       }
-    };
 
-    const fetchBulk = async () => {
-      const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=csv&gid=0`;
-      const response = await fetchWithRetry(url, { referrerPolicy: 'no-referrer' });
-      const textData = await response.text();
-      if (textData.includes('<!DOCTYPE html>') || textData.length < 500) return false;
-      
-      const results = Papa.parse(textData, { header: false, skipEmptyLines: true });
-      const rows = results.data as any[][];
-      if (rows.length <= 1) return false;
-
-      // Skip header, store raw data directly
-      for (let i = 1; i < rows.length; i++) {
-        const row = rows[i];
-        const t = normalizeSearchKey(row[COL.TPIN - 1]);
-        const m1 = normalizeSearchKey(row[COL.MOBILE_1 - 1]);
-        const m2 = normalizeSearchKey(row[COL.MOBILE_2 - 1]);
-        if (t) freshIndex.set(t, row);
-        if (m1) freshIndex.set(m1, row);
-        if (m2) freshIndex.set(m2, row);
+      if (success && freshIndex.size > 0) {
+        cachedIndex = freshIndex;
+        lastSyncTime = Date.now();
+        await savePersistentCache();
+        console.log(`[Sync] Update Complete: ${cachedIndex.size} entries.`);
       }
-      return true;
-    };
-
-    const fetchRealtime = async () => {
-      const response = await fetchWithRetry(`${APPSCRIPT_URL}?action=sync&cb=${Date.now()}`, { referrerPolicy: 'no-referrer' });
-      const result = await response.json();
-      if (!result || !result.ok || !Array.isArray(result.data)) return false;
-
-      for (const rawRow of result.data) {
-        const t = normalizeSearchKey(rawRow[COL.TPIN - 1]);
-        const m1 = normalizeSearchKey(rawRow[COL.MOBILE_1 - 1]);
-        const m2 = normalizeSearchKey(rawRow[COL.MOBILE_2 - 1]);
-        if (t) freshIndex.set(t, rawRow);
-        if (m1) freshIndex.set(m1, rawRow);
-        if (m2) freshIndex.set(m2, rawRow);
+    } catch (err) {
+      if (cachedIndex.size > 0) {
+        console.warn('[System] Network/CORS issue detected. System is continuing with currently saved data.');
+      } else {
+        console.error('[System] Boot Sync failed. Check if Sheet is public.', err);
       }
-      return true;
-    };
-
-    let success = false;
-    if (mode === 'bulk') {
-      try { 
-        success = await fetchBulk(); 
-        console.log('[Sync] Bulk Load: OK');
-      } catch (e) { 
-        console.warn('[Sync] Bulk failed, using Realtime fallback...');
-        success = await fetchRealtime(); 
-      }
-    } else {
-      success = await fetchRealtime();
+    } finally {
+      isFetching = false;
+      activeSyncPromise = null;
     }
+  })();
 
-    if (success && freshIndex.size > 0) {
-      cachedIndex = freshIndex;
-      lastSyncTime = Date.now();
-      await savePersistentCache();
-      console.log(`[Sync] Update Complete: ${cachedIndex.size} entries.`);
-    }
-  } catch (err) {
-    if (cachedIndex.size > 0) {
-      console.warn('[System] Network/CORS issue detected. System is continuing with currently saved data.');
-    } else {
-      console.error('[System] Boot Sync failed. Check if Sheet is public.', err);
-    }
-  }
-  isFetching = false;
+  await activeSyncPromise;
 }
 
 export async function startBackgroundSync() {
@@ -336,6 +348,20 @@ export async function searchExaminerAPI(query: string, forceLive = false, signal
 
   const searchKey = normalizeSearchKey(query);
 
+  // 1. Ensure initial load from local IndexedDB cache is done
+  await initialLoadPromise;
+
+  // 2. If local cache is still empty, wait for the background sync to finish (or force a bulk sync)
+  if (cachedIndex.size === 0) {
+    console.log("[Search] Cache is empty. Waiting for active sync...");
+    if (activeSyncPromise) {
+      await activeSyncPromise;
+    } else {
+      await updateClientCache('bulk');
+    }
+  }
+
+  // 3. Check if we have the search key in our synchronized cache
   if (!forceLive && cachedIndex.has(searchKey)) {
     const rawData = cachedIndex.get(searchKey);
     // LAZY MAP: Map only when found
@@ -343,9 +369,22 @@ export async function searchExaminerAPI(query: string, forceLive = false, signal
     return { ok: true, data: mapped };
   }
 
-  // Create localized controller to automatically timeout after 5 seconds to prevent endless spinning
+  // 4. If key not found in cache, check if we need to run a live realtime sync to pull any newly added data
+  const now = Date.now();
+  if (!forceLive && (now - lastSyncTime > 15000)) { // Only sync if previous sync was more than 15s ago to avoid spamming
+    console.log("[Search] Key not found in cache. Performing rapid realtime sync check...");
+    await updateClientCache('realtime');
+    
+    if (cachedIndex.has(searchKey)) {
+      const rawData = cachedIndex.get(searchKey);
+      const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
+      return { ok: true, data: mapped };
+    }
+  }
+
+  // 5. If still not found, fallback to the direct Apps Script lookup endpoint with 10 seconds timeout for reliability
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 5000);
+  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout for fallback search to prevent premature timeouts
   
   const onAbort = () => {
     controller.abort();
