@@ -411,11 +411,10 @@ export default function App() {
       </main>
       
       {/* Footer Branding */}
-      <footer className="mt-12 text-center">
-        <div className="inline-flex items-center gap-2 px-3 py-1.5 bg-white rounded-full border border-slate-200 shadow-sm">
-          <ShieldCheck className="w-3.5 h-3.5 text-blue-600" />
-          <span className="text-[9px] font-bold text-slate-500 uppercase tracking-widest">Powered by Examiner Portal v9.0</span>
-        </div>
+      <footer className="mt-12 pt-6 border-t border-slate-200 text-center">
+        <p className="text-slate-500 text-[13px] font-medium">
+          Copyright @ Exam Scripts Department. All rights reserved. 2026
+        </p>
       </footer>
     </div>
   );
