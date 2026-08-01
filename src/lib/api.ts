@@ -119,55 +119,79 @@ async function getDB() {
 }
 
 async function saveToDB(key: string, val: any) {
-  try {
-    const db = await getDB();
-    const tx = db.transaction(STORE_NAME, 'readwrite');
-    tx.objectStore(STORE_NAME).put(val, key);
-  } catch (e) { console.error('DB Save fail', e); }
+  return new Promise<void>((resolve) => {
+    getDB().then(db => {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      const store = tx.objectStore(STORE_NAME);
+      store.put(val, key);
+      tx.oncomplete = () => resolve();
+      tx.onerror = (err) => {
+        console.error('DB Save tx error', err);
+        resolve();
+      };
+    }).catch(e => {
+      console.error('DB Save fail', e);
+      resolve();
+    });
+  });
 }
 
 async function getFromDB(key: string) {
-  try {
-    const db = await getDB();
-    const tx = db.transaction(STORE_NAME, 'readonly');
-    return new Promise((resolve) => {
-      const req = tx.objectStore(STORE_NAME).get(key);
+  return new Promise<any>((resolve) => {
+    getDB().then(db => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const req = store.get(key);
       req.onsuccess = () => resolve(req.result);
-    });
-  } catch (e) { return null; }
+      req.onerror = () => resolve(null);
+      tx.onerror = () => resolve(null);
+    }).catch(() => resolve(null));
+  });
 }
 
-let cachedIndex: Map<string, any[]> = new Map(); // Stores RAW row arrays for speed
+let cachedIndex: Map<string, any> = new Map(); // Stores RAW row arrays or mapped examiner objects for speed
 let isFetching = false;
 let lastSyncTime = 0;
 let activeSyncPromise: Promise<void> | null = null;
 
 async function loadPersistentCache() {
-  const saved = await getFromDB('full_index') as any[][];
+  const saved = await getFromDB('full_index') as any[];
   const ts = await getFromDB('sync_ts') as number;
   
-  if (saved && Array.isArray(saved)) {
+  if (saved && Array.isArray(saved) && saved.length > 0) {
     const freshIndex = new Map();
-    for (const rawRow of saved) {
-      // Indexing raw rows directly (Lightning Fast)
-      const t = normalizeSearchKey(rawRow[COL.TPIN - 1]);
-      const m1 = normalizeSearchKey(rawRow[COL.MOBILE_1 - 1]);
-      const m2 = normalizeSearchKey(rawRow[COL.MOBILE_2 - 1]);
-      if (t) freshIndex.set(t, rawRow);
-      if (m1) freshIndex.set(m1, rawRow);
-      if (m2) freshIndex.set(m2, rawRow);
+    for (const item of saved) {
+      if (!item) continue;
+      if (Array.isArray(item)) {
+        // Indexing raw rows directly
+        const t = normalizeSearchKey(item[COL.TPIN - 1]);
+        const m1 = normalizeSearchKey(item[COL.MOBILE_1 - 1]);
+        const m2 = normalizeSearchKey(item[COL.MOBILE_2 - 1]);
+        if (t) freshIndex.set(t, item);
+        if (m1) freshIndex.set(m1, item);
+        if (m2) freshIndex.set(m2, item);
+      } else if (typeof item === 'object' && item.quick) {
+        // Indexing mapped objects from direct lookup
+        const t = normalizeSearchKey(item.quick.tpin);
+        const m1 = normalizeSearchKey(item.quick.mobile1);
+        const m2 = normalizeSearchKey(item.quick.mobile2);
+        if (t) freshIndex.set(t, item);
+        if (m1) freshIndex.set(m1, item);
+        if (m2) freshIndex.set(m2, item);
+      }
     }
     cachedIndex = freshIndex;
     lastSyncTime = ts || 0;
-    console.log(`[System] Ultra-Load: ${cachedIndex.size} entries ready in 0.1s`);
+    console.log(`[IndexedDB] Ultra-Load: ${cachedIndex.size} entries loaded from IndexedDB in 0.1s`);
   }
 }
 
 async function savePersistentCache() {
-  // Save only unique raw rows
-  const allRawRows = Array.from(new Set(cachedIndex.values()));
-  await saveToDB('full_index', allRawRows);
+  if (cachedIndex.size === 0) return;
+  const allItems = Array.from(new Set(cachedIndex.values()));
+  await saveToDB('full_index', allItems);
   await saveToDB('sync_ts', Date.now());
+  console.log(`[IndexedDB] Stored ${allItems.length} records into IndexedDB persistent storage.`);
 }
 
 // Initial Fast Load
@@ -290,16 +314,17 @@ export async function updateClientCache(mode: 'bulk' | 'realtime' = 'realtime') 
       };
 
       let success = false;
-      if (mode === 'bulk') {
-        try { 
+      // Always try realtime AppsScript sync first because CSV export endpoint is cached by Google CDN for 5 mins
+      try { 
+        success = await fetchRealtime(); 
+        console.log('[Sync] Realtime Sync: OK');
+      } catch (e) { 
+        console.warn('[Sync] Realtime failed, trying Bulk CSV fallback...');
+        try {
           success = await fetchBulk(); 
-          console.log('[Sync] Bulk Load: OK');
-        } catch (e) { 
-          console.warn('[Sync] Bulk failed, using Realtime fallback...');
-          success = await fetchRealtime(); 
+        } catch (e2) {
+          console.error('[Sync] All sync methods failed');
         }
-      } else {
-        success = await fetchRealtime();
       }
 
       if (success && freshIndex.size > 0) {
@@ -369,6 +394,8 @@ async function fetchDirectAppsScript(query: string, parentSignal?: AbortSignal) 
     if (result && result.ok) {
       // Store in memory cache for instant future lookup
       cachedIndex.set(searchKey, result.data);
+      // Persist to IndexedDB immediately so it is available offline / next session
+      savePersistentCache().catch(err => console.error('[IndexedDB] Persistent save error:', err));
       return { ok: true, data: result.data };
     }
     return { ok: false, message: result?.message || "No examiner found." };
@@ -395,48 +422,27 @@ export async function searchExaminerAPI(query: string, forceLive = false, signal
   // 1. Ensure initial load from local IndexedDB cache is done
   await initialLoadPromise;
 
-  // 2. If local cache is still empty, run a fast direct lookup immediately
-  // and trigger the background sync so it builds silently without blocking the user.
-  if (cachedIndex.size === 0) {
-    console.log("[Search] Cache is empty. Running rapid direct lookup first...");
-    
-    // Trigger bulk sync in background silently (do not await it here!)
-    if (!activeSyncPromise) {
-      updateClientCache('bulk').catch(err => console.error('[Sync] Background sync error:', err));
-    }
-    
-    // Run instant direct single query lookup (very fast, < 300ms)
-    const directResult = await fetchDirectAppsScript(query, signal);
-    if (directResult.ok) {
-      return directResult;
-    }
-    
-    // If direct lookup didn't find anything, we can still wait for the active background sync to complete as fallback
-    if (activeSyncPromise) {
-      console.log("[Search] Direct lookup not found, waiting for active background sync...");
-      await activeSyncPromise;
-      if (cachedIndex.has(searchKey)) {
-        const rawData = cachedIndex.get(searchKey);
-        const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
-        return { ok: true, data: mapped };
-      }
-    }
-  }
-
-  // 3. Check if we have the search key in our synchronized cache
+  // 2. INSTANT SEARCH: If data exists in local IndexedDB / RAM cache, return immediately (0.001s)
   if (!forceLive && cachedIndex.has(searchKey)) {
     const rawData = cachedIndex.get(searchKey);
-    // LAZY MAP: Map only when found
     const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
     return { ok: true, data: mapped };
   }
 
-  // 4. If key not found in cache, check if we need to run a live realtime sync to pull any newly added data
-  const now = Date.now();
-  if (!forceLive && (now - lastSyncTime > 15000)) { // Only sync if previous sync was more than 15s ago to avoid spamming
-    console.log("[Search] Key not found in cache. Performing rapid realtime sync check...");
-    await updateClientCache('realtime');
-    
+  // 3. Trigger background cache sync silently if cache is empty
+  if (cachedIndex.size === 0 && !activeSyncPromise) {
+    updateClientCache('realtime').catch(err => console.error('[Sync] Background sync error:', err));
+  }
+
+  // 4. Not in local cache: Perform direct live lookup via Apps Script
+  const directResult = await fetchDirectAppsScript(query, signal);
+  if (directResult.ok) {
+    return directResult;
+  }
+
+  // 5. Fallback: Wait for active background sync if cache was building
+  if (activeSyncPromise) {
+    await activeSyncPromise;
     if (cachedIndex.has(searchKey)) {
       const rawData = cachedIndex.get(searchKey);
       const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
@@ -444,6 +450,5 @@ export async function searchExaminerAPI(query: string, forceLive = false, signal
     }
   }
 
-  // 5. If still not found, fallback to direct Apps Script lookup
-  return await fetchDirectAppsScript(query, signal);
+  return { ok: false, message: directResult?.message || "No examiner found." };
 }

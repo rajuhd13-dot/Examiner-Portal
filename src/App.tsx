@@ -413,7 +413,7 @@ export default function App() {
       {/* Footer Branding */}
       <footer className="mt-12 pt-6 border-t border-slate-200 text-center">
         <p className="text-slate-500 text-[13px] font-medium">
-          Copyright @ Exam Scripts Department. All rights reserved. 2026
+          Copyright © Exam Scripts Department. All rights reserved. 2026
         </p>
       </footer>
     </div>
