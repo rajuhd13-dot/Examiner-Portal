@@ -96,6 +96,46 @@ function buildDefaultRemarkBody() {
   ].join('\n');
 }
 
+function mapRowFromServer(row: any[]) {
+  const g = (col: number) => row[col - 1] || '';
+  return {
+    quick: {
+      tpin: g(COL.TPIN), rm: String(g(COL.RM)).trim(), nickName: g(COL.NICK_NAME),
+      fullName: g(COL.FULL_NAME), mobile1: g(COL.MOBILE_1), mobile2: g(COL.MOBILE_2), 
+      nagadNumber: g(COL.MOBILE_BANKING), institute: g(COL.INST), department: g(COL.DEPT),
+      hscGpa: g(COL.HSC_GPA), hscBatch: formatBatch(g(COL.HSC_BATCH)),
+      trainingReport: g(COL.TRAINING_REPORT), trainingDate: g(COL.TRAINING_DATE),
+      physicalCampus: g(COL.PHYSICAL_CAMPUS_PREF)
+    },
+    personal: {
+      fathersName: g(COL.FATHERS_NAME), mothersName: g(COL.MOTHERS_NAME),
+      religion: g(COL.RELIGION), gender: g(COL.GENDER), dateOfBirth: g(COL.DATE_OF_BIRTH), 
+      hscRoll: g(COL.HSC_ROLL), hscReg: g(COL.HSC_REG), hscBoard: g(COL.HSC_BOARD),
+      teamsId: g(COL.TEAMS_ID), email: g(COL.EMAIL), homeDistrict: g(COL.HOME_DISTRICT), 
+      subjectsChoice: [g(COL.SUBJECT_1), g(COL.SUBJECT_2), g(COL.SUBJECT_3), g(COL.SUBJECT_4), g(COL.SUBJECT_5)].filter(Boolean).join(', '),
+      versionInterested: g(COL.VERSION_INTERESTED), runningProgram: g(COL.RUNNING_PROGRAM), 
+      previousProgram: g(COL.PREVIOUS_PROGRAM), regDate: g(COL.FORM_FILL_DATE), 
+      selectedSub: g(COL.SELECTED_SUBJECT), idChecked: g(COL.ID_CHECKED)
+    },
+    assessments: [
+      makeAssessment('English', g(COL.ENGLISH_PCT), g(COL.ENGLISH_SET), g(COL.ENGLISH_DATE), ALLOW_MARK.ENGLISH),
+      makeAssessment('Bangla', g(COL.BANGLA_PCT), g(COL.BANGLA_SET), g(COL.BANGLA_DATE), ALLOW_MARK.BANGLA),
+      makeAssessment('Physics', g(COL.PHYSICS_PCT), g(COL.PHYSICS_SET), g(COL.PHYSICS_DATE), ALLOW_MARK.PHYSICS),
+      makeAssessment('Chemistry', g(COL.CHEMISTRY_PCT), g(COL.CHEMISTRY_SET), g(COL.CHEMISTRY_DATE), ALLOW_MARK.CHEMISTRY),
+      makeAssessment('Math', g(COL.MATH_PCT), g(COL.MATH_SET), g(COL.MATH_DATE), ALLOW_MARK.MATH),
+      makeAssessment('Biology', g(COL.BIOLOGY_PCT), g(COL.BIOLOGY_SET), g(COL.BIOLOGY_DATE), ALLOW_MARK.BIOLOGY),
+      makeAssessment('ICT', g(COL.ICT_PCT), g(COL.ICT_SET), g(COL.ICT_DATE), ALLOW_MARK.ICT)
+    ],
+    remark: {
+      show: String(g(COL.RM)).trim() === '4',
+      rmValue: String(g(COL.RM)).trim(),
+      body: String(g(COL.RM4_COMMENT)).trim() || buildDefaultRemarkBody(),
+      byLine: String(g(COL.REMARK_BY)).trim(),
+      dateLine: String(g(COL.REMARK_DATE)).trim() ? ('Date: ' + String(g(COL.REMARK_DATE)).trim()) : ''
+    }
+  };
+}
+
 // --- Global Cache for 0.1s Search ---
 let cachedIndex: Map<string, any> = new Map();
 let lastSyncTime = 0;
@@ -108,126 +148,70 @@ async function updateServerCache(mode: 'bulk' | 'realtime' = 'realtime') {
   isFetching = true;
   
   try {
-    if (mode === 'bulk') {
-      console.log(`[Cache] Bulk Syncing from CSV...`);
-      const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=csv&gid=0&cb=${Date.now()}`;
-      const response = await axios.get(url, { timeout: 15000 });
-      
-      if (typeof response.data === 'string' && !response.data.includes('<!DOCTYPE html>')) {
-        const results = Papa.parse(response.data, { header: false, skipEmptyLines: true });
-        const rows = results.data as string[][];
+    console.log(`[Cache] Attempting CSV bulk sync...`);
+    const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=csv&gid=0&cb=${Date.now()}`;
+    const response = await axios.get(url, { timeout: 15000 });
+    
+    if (typeof response.data === 'string' && !response.data.includes('<!DOCTYPE html>')) {
+      const results = Papa.parse(response.data, { header: false, skipEmptyLines: true });
+      const rows = results.data as string[][];
 
-        if (rows.length > 1) {
-          const newIndex = new Map();
-          for (let i = 1; i < rows.length; i++) {
-            const row = rows[i];
-            if (!row || row.length < 10) continue;
+      if (rows.length > 1) {
+        const newIndex = new Map();
+        for (let i = 1; i < rows.length; i++) {
+          const row = rows[i];
+          if (!row || row.length < 10) continue;
 
-            const g = (col: number) => row[col - 1] || '';
-            
-            const mappedData = {
-              quick: {
-                tpin: g(COL.TPIN), rm: String(g(COL.RM)).trim(), nickName: g(COL.NICK_NAME),
-                fullName: g(COL.FULL_NAME), mobile1: g(COL.MOBILE_1), mobile2: g(COL.MOBILE_2), 
-                nagadNumber: g(COL.MOBILE_BANKING), institute: g(COL.INST), department: g(COL.DEPT),
-                hscGpa: g(COL.HSC_GPA), hscBatch: formatBatch(g(COL.HSC_BATCH)),
-                trainingReport: g(COL.TRAINING_REPORT), trainingDate: g(COL.TRAINING_DATE),
-                physicalCampus: g(COL.PHYSICAL_CAMPUS_PREF)
-              },
-              personal: {
-                fathersName: g(COL.FATHERS_NAME), mothersName: g(COL.MOTHERS_NAME),
-                religion: g(COL.RELIGION), gender: g(COL.GENDER), dateOfBirth: g(COL.DATE_OF_BIRTH), 
-                hscRoll: g(COL.HSC_ROLL), hscReg: g(COL.HSC_REG), hscBoard: g(COL.HSC_BOARD),
-                teamsId: g(COL.TEAMS_ID), email: g(COL.EMAIL), homeDistrict: g(COL.HOME_DISTRICT), 
-                subjectsChoice: [g(COL.SUBJECT_1), g(COL.SUBJECT_2), g(COL.SUBJECT_3), g(COL.SUBJECT_4), g(COL.SUBJECT_5)].filter(Boolean).join(', '),
-                versionInterested: g(COL.VERSION_INTERESTED), runningProgram: g(COL.RUNNING_PROGRAM), 
-                previousProgram: g(COL.PREVIOUS_PROGRAM), regDate: g(COL.FORM_FILL_DATE), 
-                selectedSub: g(COL.SELECTED_SUBJECT), idChecked: g(COL.ID_CHECKED)
-              },
-              assessments: [
-                makeAssessment('English', g(COL.ENGLISH_PCT), g(COL.ENGLISH_SET), g(COL.ENGLISH_DATE), ALLOW_MARK.ENGLISH),
-                makeAssessment('Bangla', g(COL.BANGLA_PCT), g(COL.BANGLA_SET), g(COL.BANGLA_DATE), ALLOW_MARK.BANGLA),
-                makeAssessment('Physics', g(COL.PHYSICS_PCT), g(COL.PHYSICS_SET), g(COL.PHYSICS_DATE), ALLOW_MARK.PHYSICS),
-                makeAssessment('Chemistry', g(COL.CHEMISTRY_PCT), g(COL.CHEMISTRY_SET), g(COL.CHEMISTRY_DATE), ALLOW_MARK.CHEMISTRY),
-                makeAssessment('Math', g(COL.MATH_PCT), g(COL.MATH_SET), g(COL.MATH_DATE), ALLOW_MARK.MATH),
-                makeAssessment('Biology', g(COL.BIOLOGY_PCT), g(COL.BIOLOGY_SET), g(COL.BIOLOGY_DATE), ALLOW_MARK.BIOLOGY),
-                makeAssessment('ICT', g(COL.ICT_PCT), g(COL.ICT_SET), g(COL.ICT_DATE), ALLOW_MARK.ICT)
-              ],
-              remark: {
-                show: String(g(COL.RM)).trim() === '4',
-                rmValue: String(g(COL.RM)).trim(),
-                body: String(g(COL.RM4_COMMENT)).trim() || buildDefaultRemarkBody(),
-                byLine: String(g(COL.REMARK_BY)).trim(),
-                dateLine: String(g(COL.REMARK_DATE)).trim() ? ('Date: ' + String(g(COL.REMARK_DATE)).trim()) : ''
-              }
-            };
+          const mappedData = mapRowFromServer(row);
 
-            const t = normalizeSearchKey(g(COL.TPIN));
-            const m1 = normalizeSearchKey(g(COL.MOBILE_1));
-            const m2 = normalizeSearchKey(g(COL.MOBILE_2));
-
-            if (t) newIndex.set(t, mappedData);
-            if (m1) newIndex.set(m1, mappedData);
-            if (m2) newIndex.set(m2, mappedData);
-          }
-
-          cachedIndex = newIndex; // Atomic update
-          lastSyncTime = Date.now();
-          console.log(`[Cache] Successfully bulk indexed ${newIndex.size} entries.`);
-        }
-      }
-    } else {
-      // Realtime mode via AppScript
-      const response = await axios.get(`${APPSCRIPT_URL}?action=sync&cb=${Date.now()}`, { timeout: 10000 });
-      const result = response.data;
-      
-      if (result && result.ok && Array.isArray(result.data)) {
-        const newIndex = new Map(cachedIndex); // Start with existing cache
-        for (const mappedData of result.data) {
           const t = normalizeSearchKey(mappedData.quick.tpin);
           const m1 = normalizeSearchKey(mappedData.quick.mobile1);
           const m2 = normalizeSearchKey(mappedData.quick.mobile2);
+
           if (t) newIndex.set(t, mappedData);
           if (m1) newIndex.set(m1, mappedData);
           if (m2) newIndex.set(m2, mappedData);
         }
+
         cachedIndex = newIndex; // Atomic update
         lastSyncTime = Date.now();
+        console.log(`[Cache] Successfully bulk indexed ${newIndex.size} entries from CSV.`);
+        return;
       }
     }
   } catch (err: any) {
-    // Fail silently to maintain existing cache
+    if (err.response && err.response.status === 401) {
+      console.log(`[Cache] Direct CSV export restricted (Private Sheet). On-demand search proxy & real-time webhook updates active.`);
+    } else {
+      console.log(`[Cache] Bulk CSV sync note: ${err.message || err}. On-demand search proxy & real-time webhook updates active.`);
+    }
+  } finally {
+    lastSyncTime = Date.now();
+    isFetching = false;
   }
-  isFetching = false;
 }
 
-// Initial fetch
-updateServerCache('bulk');
+// Initial background fetch to populate cache instantly on server start
+updateServerCache('bulk').catch(err => console.error(`[Cache] Initial bulk sync failed:`, err.message));
 
 // POWER SCHEDULER (Bangladesh Time UTC+6)
-// With 80,000+ rows, we do not poll Google Sheets Apps Script every 2.5s (it crashes Apps Script and times out).
-// Instead, we use instant event-driven refresh webhook pushes from Google Sheets, 
-// and a 15-minute scheduled bulk sync during work hours as a backup.
+// 1. Office hours (8:00 AM - 10:00 PM): Safety Backup Bulk Sync every 10 seconds
+// 2. Off hours (10:00 PM - 7:59 AM): Deep Backup Bulk Sync every 5 minutes
 setInterval(() => {
   const now = new Date();
-  // Get hour in Bangladesh Time (UTC+6)
-  const bdHour = (now.getUTCHours() + 6) % 24;
+  const bdTime = new Date(now.getTime() + (6 * 60 * 60 * 1000));
+  const bdHour = bdTime.getUTCHours();
   
-  // 1. Work Hours (8 AM - 10 PM): Backup CSV Sync every 15 mins
-  if (bdHour >= 8 && bdHour < 22) {
-    if (Date.now() - lastSyncTime > 15 * 60 * 1000) {
-      console.log(`[Scheduler] 15-minute scheduled backup safety Bulk Sync...`);
-      updateServerCache('bulk');
-    }
-  } 
-  // 2. Nightly Maintenance (11 PM - 6 AM): Deep Bulk Refresh every 45 mins
-  else {
-    if (Date.now() - lastSyncTime > 45 * 60 * 1000) {
-      console.log(`[Scheduler] Nightly deep scheduled backup Bulk Sync...`);
-      updateServerCache('bulk');
-    }
+  const isOfficeHours = bdHour >= 8 && bdHour < 22;
+  const intervalLimit = isOfficeHours ? 10 * 1000 : 5 * 60 * 1000;
+  const elapsed = Date.now() - lastSyncTime;
+
+  if (elapsed >= intervalLimit) {
+    const timeModeStr = isOfficeHours ? "Office Hours (10s interval)" : "Off Hours (5m interval)";
+    console.log(`[Scheduler] Running scheduled safety Bulk Sync. Mode: ${timeModeStr}. Elapsed: ${Math.round(elapsed / 1000)}s`);
+    updateServerCache('bulk');
   }
-}, 30000); // Check every 30 seconds
+}, 2000); // Check conditions every 2 seconds
 
 app.get("/api/search", async (req, res) => {
   const query = req.query.q as string;
@@ -237,8 +221,10 @@ app.get("/api/search", async (req, res) => {
 
   const searchKey = normalizeSearchKey(query);
 
+  const refresh = req.query.refresh === 'true';
+
   // 1. Try Server-Side Memory Cache (0.1s response)
-  if (cachedIndex.has(searchKey)) {
+  if (!refresh && cachedIndex.has(searchKey)) {
     console.log(`[Search] Cache HIT for ${searchKey}`);
     return res.json({ ok: true, data: cachedIndex.get(searchKey) });
   }
@@ -248,7 +234,7 @@ app.get("/api/search", async (req, res) => {
   // 2. Fallback to AppScript Proxy (Slow but reliable)
   try {
     const response = await axios.get(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}`, {
-      timeout: 30000,
+      timeout: 45000,
       maxRedirects: 5
     });
 
@@ -257,10 +243,18 @@ app.get("/api/search", async (req, res) => {
       try { data = JSON.parse(data); } catch (e) { throw new Error("Invalid JSON from AppScript"); }
     }
 
-    if (data && data.ok) {
-      // Store in cache for next time
-      cachedIndex.set(searchKey, data.data);
-      return res.json({ ok: true, data: data.data });
+    if (data && data.ok && data.data) {
+      // Store in cache for all search keys
+      const mappedData = data.data;
+      const t = normalizeSearchKey(mappedData.quick.tpin);
+      const m1 = normalizeSearchKey(mappedData.quick.mobile1);
+      const m2 = normalizeSearchKey(mappedData.quick.mobile2);
+      
+      if (t) cachedIndex.set(t, mappedData);
+      if (m1) cachedIndex.set(m1, mappedData);
+      if (m2) cachedIndex.set(m2, mappedData);
+      
+      return res.json({ ok: true, data: mappedData });
     }
 
     return res.json({ ok: false, message: data?.message || "No examiner found." });

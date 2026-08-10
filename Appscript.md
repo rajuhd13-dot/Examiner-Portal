@@ -171,23 +171,29 @@ function searchExaminer(query) {
   }
 
   var foundRow = -1;
+  var lastRow = sheet.getLastRow();
+  if (lastRow < CONFIG.DATA_START_ROW) return { ok: false, message: 'No data found in sheet' };
   
+  var targetCols = [COL.TPIN, COL.MOBILE_1, COL.MOBILE_2];
+
   for (var i = 0; i < searchValues.length; i++) {
     var val = searchValues[i];
-    var finder = sheet.createTextFinder(val).matchEntireCell(false).findAll();
-    
-    for (var j = 0; j < finder.length; j++) {
-      var cell = finder[j];
-      var r = cell.getRow();
-      var c = cell.getColumn();
-      
-      if (r >= CONFIG.DATA_START_ROW && (c === COL.TPIN || c === COL.MOBILE_1 || c === COL.MOBILE_2)) {
+    if (!val) continue;
+
+    for (var c = 0; c < targetCols.length; c++) {
+      var colIdx = targetCols[c];
+      var range = sheet.getRange(CONFIG.DATA_START_ROW, colIdx, lastRow - CONFIG.DATA_START_ROW + 1, 1);
+      var finder = range.createTextFinder(val).matchEntireCell(false).findAll();
+
+      for (var j = 0; j < finder.length; j++) {
+        var cell = finder[j];
         var cellValue = norm_(cell.getDisplayValue());
         if (cellValue === key) {
-          foundRow = r;
+          foundRow = cell.getRow();
           break;
         }
       }
+      if (foundRow !== -1) break;
     }
     if (foundRow !== -1) break;
   }

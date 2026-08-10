@@ -349,27 +349,61 @@ export async function updateClientCache(mode: 'bulk' | 'realtime' = 'realtime') 
 }
 
 export async function startBackgroundSync() {
-  console.log('[System] High-Speed Engine Ignited...');
-  
-  // Start bulk sync immediately
-  updateClientCache('bulk').catch(() => {});
-  
-  // Real-time sync slightly delayed to not block initial bulk load
-  setTimeout(() => {
-    updateClientCache('realtime').catch(() => {});
-  }, 500);
+  console.log('[System] High-Speed Engine Ignited... (Real-time webhook and fast-search proxy active)');
+}
 
-  setInterval(() => {
-    if (document.visibilityState === 'visible') {
-      updateClientCache('realtime');
+async function fetchFromBackend(query: string, forceLive = false, parentSignal?: AbortSignal) {
+  const searchKey = normalizeSearchKey(query);
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s timeout for high-capacity reliability
+
+  const onAbort = () => {
+    controller.abort();
+    clearTimeout(timeoutId);
+  };
+
+  if (parentSignal) {
+    if (parentSignal.aborted) {
+      onAbort();
+    } else {
+      parentSignal.addEventListener('abort', onAbort);
     }
-  }, 10000); // 10s sync for live updates
+  }
+
+  try {
+    const url = `/api/search?q=${encodeURIComponent(query)}${forceLive ? '&refresh=true' : ''}`;
+    const response = await fetch(url, { 
+      signal: controller.signal,
+      referrerPolicy: 'no-referrer'
+    });
+    const result = await response.json();
+
+    if (result && result.ok && result.data) {
+      // Store in memory cache for instant future lookup
+      cachedIndex.set(searchKey, result.data);
+      // Persist to IndexedDB immediately so it is available offline / next session
+      savePersistentCache().catch(err => console.error('[IndexedDB] Persistent save error:', err));
+      return { ok: true, data: result.data };
+    }
+    return { ok: false, message: result?.message || "No examiner found." };
+  } catch (error: any) {
+    if (parentSignal && parentSignal.aborted) {
+      return { ok: false, message: "Search cancelled." };
+    }
+    console.warn("[Backend] Search failed, falling back to direct Apps Script...", error);
+    return fetchDirectAppsScript(query, parentSignal);
+  } finally {
+    clearTimeout(timeoutId);
+    if (parentSignal) {
+      parentSignal.removeEventListener('abort', onAbort);
+    }
+  }
 }
 
 async function fetchDirectAppsScript(query: string, parentSignal?: AbortSignal) {
   const searchKey = normalizeSearchKey(query);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout for reliability
+  const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s timeout for high-capacity reliability
 
   const onAbort = () => {
     controller.abort();
@@ -429,15 +463,13 @@ export async function searchExaminerAPI(query: string, forceLive = false, signal
     return { ok: true, data: mapped };
   }
 
-  // 3. Trigger background cache sync silently if cache is empty
-  if (cachedIndex.size === 0 && !activeSyncPromise) {
-    updateClientCache('realtime').catch(err => console.error('[Sync] Background sync error:', err));
-  }
+  // 3. Background bulk/realtime cache sync disabled for massive private sheet to prevent timeouts.
+  // The system relies on on-demand high-speed lookup and background revalidation.
 
-  // 4. Not in local cache: Perform direct live lookup via Apps Script
-  const directResult = await fetchDirectAppsScript(query, signal);
-  if (directResult.ok) {
-    return directResult;
+  // 4. Query our Backend Server first (which has instant webhook updates), with Apps Script as fallback
+  const result = await fetchFromBackend(query, forceLive, signal);
+  if (result.ok) {
+    return result;
   }
 
   // 5. Fallback: Wait for active background sync if cache was building
@@ -450,5 +482,5 @@ export async function searchExaminerAPI(query: string, forceLive = false, signal
     }
   }
 
-  return { ok: false, message: directResult?.message || "No examiner found." };
+  return { ok: false, message: result?.message || "No examiner found." };
 }

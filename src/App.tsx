@@ -10,7 +10,8 @@ import {
   CheckCircle2, 
   XCircle,
   AlertTriangle,
-  MessageCircle
+  MessageCircle,
+  RefreshCw
 } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { clsx, type ClassValue } from "clsx";
@@ -80,6 +81,7 @@ interface ExaminerData {
 export default function App() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [data, setData] = useState<ExaminerData | null>(null);
   const [error, setError] = useState<string | null>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -99,6 +101,29 @@ export default function App() {
     };
   }, []);
 
+  // Live Auto-Refresh: When an examiner is open, automatically sync live data from Google Sheets every 2s
+  useEffect(() => {
+    if (!data?.quick?.tpin) return;
+
+    const tpin = data.quick.tpin;
+    const intervalId = setInterval(async () => {
+      try {
+        // Pass forceLive = true so it auto-syncs live directly from Google Sheets
+        const res = await searchExaminerAPI(tpin, true);
+        if (res.ok && res.data) {
+          // Compare if data changed, if so update state smoothly
+          if (JSON.stringify(res.data) !== JSON.stringify(data)) {
+            setData(res.data);
+          }
+        }
+      } catch (err) {
+        // Silent fail for background auto-polling
+      }
+    }, 2000);
+
+    return () => clearInterval(intervalId);
+  }, [data?.quick?.tpin, data]);
+
   const handleCancelSearch = (e?: React.MouseEvent | React.FormEvent) => {
     if (e) {
       e.preventDefault();
@@ -110,6 +135,25 @@ export default function App() {
     }
     setLoading(false);
     setError("Search cancelled.");
+  };
+
+  const handleRefreshLive = async (tpinToRefresh: string) => {
+    if (refreshing) return;
+    setRefreshing(true);
+    setError(null);
+    try {
+      const result = await searchExaminerAPI(tpinToRefresh, true);
+      if (result.ok && result.data) {
+        setData(result.data);
+      } else {
+        setError(result.message || "Failed to refresh data from Google Sheets.");
+      }
+    } catch (err: any) {
+      console.error("Refresh error:", err);
+      setError(err.message || "Failed to connect to Google Sheets.");
+    } finally {
+      setRefreshing(false);
+    }
   };
 
   const handleSearch = async (e?: React.FormEvent) => {
@@ -135,7 +179,7 @@ export default function App() {
     setLoading(true);
 
     try {
-      // searchExaminerAPI handles the 0.1s cache internally, now supports AbortSignal & 5s timeout
+      // 1. searchExaminerAPI handles the cache internally, supports AbortSignal
       const result = await searchExaminerAPI(searchKey, false, controller.signal);
 
       if (controller.signal.aborted) {
@@ -144,11 +188,34 @@ export default function App() {
 
       if (result.ok) {
         setData(result.data);
+        // Turn off main loader so user gets cached response instantly
+        setLoading(false);
+
+        // 2. Perform silent background revalidation (forceLive = true) to fetch fresh Google Sheet data
+        searchExaminerAPI(searchKey, true, controller.signal).then((liveResult) => {
+          if (!controller.signal.aborted && liveResult.ok && liveResult.data) {
+            setData(liveResult.data);
+          }
+        }).catch((err) => {
+          console.warn("Silent background refresh failed:", err);
+        });
+
       } else {
-        // Only set error if it's a manual search or we've reached full length
-        if (searchKey.length >= 4) {
-          setData(null);
-          setError(result.message || "No examiner found.");
+        // Cache miss: Live search via Apps Script directly
+        const liveResult = await searchExaminerAPI(searchKey, true, controller.signal);
+
+        if (controller.signal.aborted) {
+          return;
+        }
+
+        if (liveResult.ok) {
+          setData(liveResult.data);
+        } else {
+          // Only set error if it's a manual search or we've reached full length
+          if (searchKey.length >= 4) {
+            setData(null);
+            setError(liveResult.message || "No examiner found.");
+          }
         }
       }
     } catch (err: any) {
@@ -254,6 +321,7 @@ export default function App() {
         <AnimatePresence mode="wait">
           {error && (
             <motion.div 
+              key="search-error"
               initial={{ opacity: 0, y: -10 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0 }}
@@ -302,7 +370,16 @@ export default function App() {
                     <h2 className="text-white font-bold text-xl tracking-tight">Examiner Quick Info</h2>
                     <p className="text-slate-300 text-[11px] mt-0.5 font-medium">Primary profile & eligibility snapshot</p>
                   </div>
-                  <div className="flex gap-3">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => handleRefreshLive(data.quick.tpin)}
+                      disabled={refreshing}
+                      className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 text-white font-bold text-xs rounded-full flex items-center gap-1.5 transition-all shadow-md active:scale-95 cursor-pointer disabled:cursor-not-allowed border border-white/10"
+                    >
+                      <RefreshCw className={cn("w-3.5 h-3.5", refreshing && "animate-spin")} />
+                      <span>{refreshing ? "Refreshing..." : "Refresh"}</span>
+                    </button>
                     <div className="px-4 py-1.5 bg-[#2d3a75] rounded-full flex items-center gap-2 border border-white/5">
                       <span className="text-slate-300 text-[11px] font-bold">T-Pin</span>
                       <span className="text-[#facc15] font-bold text-sm">{data.quick.tpin}</span>
