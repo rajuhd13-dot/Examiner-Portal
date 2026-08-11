@@ -16,7 +16,7 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
-import { searchExaminerAPI, startBackgroundSync } from "./lib/api";
+import { searchExaminerAPI, startBackgroundSync, getLocalCache } from "./lib/api";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -81,6 +81,7 @@ interface ExaminerData {
 export default function App() {
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [data, setData] = useState<ExaminerData | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -124,6 +125,7 @@ export default function App() {
     return () => clearInterval(intervalId);
   }, [data?.quick?.tpin, data]);
 
+  // Auto search disabled as requested - search will only trigger when user clicks Search or presses Enter
   const handleCancelSearch = (e?: React.MouseEvent | React.FormEvent) => {
     if (e) {
       e.preventDefault();
@@ -156,19 +158,18 @@ export default function App() {
     }
   };
 
-  const handleSearch = async (e?: React.FormEvent) => {
+  const executeSearch = async (searchKey: string, forceLive = true, e?: React.FormEvent) => {
     e?.preventDefault();
-    if (loading) return; // Block double submission while searching
-
-    const searchKey = query.trim();
-    if (!searchKey) return;
-
-    // If already showing this data, don't re-fetch unless it's a manual search
-    if (!e && data && (data.quick.tpin === searchKey || data.quick.mobile1 === searchKey || data.quick.mobile2 === searchKey)) {
+    const key = searchKey.trim();
+    if (!key) {
+      setData(null);
+      setError(null);
+      setLoading(false);
+      setIsSyncing(false);
       return;
     }
 
-    // Abort any active searches before triggering new one
+    // Abort active controller if any
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
@@ -176,65 +177,55 @@ export default function App() {
     abortControllerRef.current = controller;
 
     setError(null);
-    setLoading(true);
+
+    // 1. Check if we have local cached data and render it instantly
+    const cachedData = getLocalCache(key);
+    let hasCached = false;
+    if (cachedData) {
+      setData(cachedData);
+      hasCached = true;
+      // We have data, so no need to block the user with a main loading spinner
+      setLoading(false);
+      setIsSyncing(true);
+    } else {
+      // No cache, show main loading spinner for the upcoming single live request
+      setLoading(true);
+      setIsSyncing(false);
+    }
 
     try {
-      // 1. searchExaminerAPI handles the cache internally, supports AbortSignal
-      const result = await searchExaminerAPI(searchKey, false, controller.signal);
+      // 2. Perform ONE live fetch to get fresh real-time data from Google Sheet
+      const liveResult = await searchExaminerAPI(key, true, controller.signal);
+      if (controller.signal.aborted) return;
 
-      if (controller.signal.aborted) {
-        return;
-      }
-
-      if (result.ok) {
-        setData(result.data);
-        // Turn off main loader so user gets cached response instantly
-        setLoading(false);
-
-        // 2. Perform silent background revalidation (forceLive = true) to fetch fresh Google Sheet data
-        searchExaminerAPI(searchKey, true, controller.signal).then((liveResult) => {
-          if (!controller.signal.aborted && liveResult.ok && liveResult.data) {
-            setData(liveResult.data);
+      if (liveResult.ok && liveResult.data) {
+        setData(prev => {
+          if (prev && JSON.stringify(prev) === JSON.stringify(liveResult.data)) {
+            return prev;
           }
-        }).catch((err) => {
-          console.warn("Silent background refresh failed:", err);
+          return liveResult.data;
         });
-
-      } else {
-        // Cache miss: Live search via Apps Script directly
-        const liveResult = await searchExaminerAPI(searchKey, true, controller.signal);
-
-        if (controller.signal.aborted) {
-          return;
-        }
-
-        if (liveResult.ok) {
-          setData(liveResult.data);
-        } else {
-          // Only set error if it's a manual search or we've reached full length
-          if (searchKey.length >= 4) {
-            setData(null);
-            setError(liveResult.message || "No examiner found.");
-          }
-        }
+        setError(null);
+      } else if (!hasCached) {
+        setData(null);
+        setError(liveResult.message || "No examiner found.");
       }
     } catch (err: any) {
-      if (controller.signal.aborted) {
-        return;
-      }
-      if (err.name === "AbortError") {
-        console.log("Search request aborted.");
-      } else {
-        console.error("Search error:", err);
+      if (!controller.signal.aborted && !hasCached) {
         setError(err.message || "Server error occurred.");
       }
     } finally {
-      // Direct comparison to check if this was our current active controller
       if (abortControllerRef.current === controller) {
         abortControllerRef.current = null;
         setLoading(false);
+        setIsSyncing(false);
       }
     }
+  };
+
+  const handleSearch = (e?: React.FormEvent) => {
+    e?.preventDefault();
+    executeSearch(query, true, e);
   };
 
   const getWaLink = (num: string) => {
@@ -365,21 +356,21 @@ export default function App() {
 
               {/* 2. Examiner Quick Info */}
               <section className="bg-white rounded-[12px] shadow-sm border border-slate-200 overflow-hidden">
-                <div className="bg-[#1e295b] px-6 py-2.5 flex flex-wrap items-center justify-between gap-3">
+                <div className="bg-[#1e295b] px-6 py-2.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
                   <div>
                     <h2 className="text-white font-bold text-xl tracking-tight">Examiner Quick Info</h2>
-                    <p className="text-slate-300 text-[11px] mt-0.5 font-medium">Primary profile & eligibility snapshot</p>
+                    <p className="text-slate-300 text-[11px] mt-0.5 font-medium flex items-center gap-1.5 h-5 overflow-hidden whitespace-nowrap">
+                      {isSyncing ? (
+                        <>
+                          <Loader2 className="w-3.5 h-3.5 animate-spin text-green-400 shrink-0" />
+                          <span className="text-green-400 font-bold animate-pulse">Syncing real-time Google Sheet data...</span>
+                        </>
+                      ) : (
+                        "Primary profile & eligibility snapshot"
+                      )}
+                    </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-3">
-                    <button
-                      type="button"
-                      onClick={() => handleRefreshLive(data.quick.tpin)}
-                      disabled={refreshing}
-                      className="px-4 py-1.5 bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 text-white font-bold text-xs rounded-full flex items-center gap-1.5 transition-all shadow-md active:scale-95 cursor-pointer disabled:cursor-not-allowed border border-white/10"
-                    >
-                      <RefreshCw className={cn("w-3.5 h-3.5", refreshing && "animate-spin")} />
-                      <span>{refreshing ? "Refreshing..." : "Refresh"}</span>
-                    </button>
                     <div className="px-4 py-1.5 bg-[#2d3a75] rounded-full flex items-center gap-2 border border-white/5">
                       <span className="text-slate-300 text-[11px] font-bold">T-Pin</span>
                       <span className="text-[#facc15] font-bold text-sm">{data.quick.tpin}</span>

@@ -1,10 +1,12 @@
 import express from "express";
+import compression from "compression";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import axios from "axios";
 import Papa from "papaparse";
 
 const app = express();
+app.use(compression());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 const PORT = 3000;
@@ -59,11 +61,11 @@ function normalizeSearchKey(value: string) {
 function anyScorePasses(value: string, allowMark: number) {
   const str = String(value || '').trim();
   if (!str) return false;
-  const parts = str.split('/');
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i].trim();
-    const num = Number(part);
-    if (!isNaN(num) && part !== '' && num >= allowMark) return true;
+  const matches = str.match(/\d+(?:\.\d+)?/g);
+  if (!matches) return false;
+  for (let i = 0; i < matches.length; i++) {
+    const num = Number(matches[i]);
+    if (!isNaN(num) && num >= allowMark) return true;
   }
   return false;
 }
@@ -75,7 +77,7 @@ function makeAssessment(name: string, pct: string, set: string, date: string, al
   const hasAny = percentText || setText || dateText;
   let status = 'No Exam';
   if (hasAny) {
-    status = anyScorePasses(percentText, allowMark) ? 'Allow' : 'Not Allow';
+    status = (anyScorePasses(percentText, allowMark) || anyScorePasses(setText, allowMark)) ? 'Allow' : 'Not Allow';
   }
   return { subject: name + ' (%)', percent: percentText, set: setText, date: dateText, status: status };
 }
@@ -147,71 +149,136 @@ async function updateServerCache(mode: 'bulk' | 'realtime' = 'realtime') {
   if (isFetching) return;
   isFetching = true;
   
-  try {
-    console.log(`[Cache] Attempting CSV bulk sync...`);
-    const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=csv&gid=0&cb=${Date.now()}`;
-    const response = await axios.get(url, { timeout: 15000 });
-    
-    if (typeof response.data === 'string' && !response.data.includes('<!DOCTYPE html>')) {
-      const results = Papa.parse(response.data, { header: false, skipEmptyLines: true });
-      const rows = results.data as string[][];
+  let success = false;
+  const newIndex = new Map();
 
-      if (rows.length > 1) {
-        const newIndex = new Map();
-        for (let i = 1; i < rows.length; i++) {
-          const row = rows[i];
-          if (!row || row.length < 10) continue;
-
-          const mappedData = mapRowFromServer(row);
-
-          const t = normalizeSearchKey(mappedData.quick.tpin);
-          const m1 = normalizeSearchKey(mappedData.quick.mobile1);
-          const m2 = normalizeSearchKey(mappedData.quick.mobile2);
-
-          if (t) newIndex.set(t, mappedData);
-          if (m1) newIndex.set(m1, mappedData);
-          if (m2) newIndex.set(m2, mappedData);
+  // 1. If mode is realtime, try real-time Apps Script sync first (100% fresh)
+  if (mode === 'realtime') {
+    try {
+      console.log(`[Cache] Attempting real-time Apps Script sync...`);
+      const response = await axios.get(`${APPSCRIPT_URL}?action=sync&cb=${Date.now()}`, { timeout: 15000 });
+      const resData = response.data;
+      if (resData && resData.ok && Array.isArray(resData.data)) {
+        const rows = resData.data;
+        if (rows.length > 0) {
+          for (const row of rows) {
+            if (!row || row.length < 10) continue;
+            const mappedData = mapRowFromServer(row);
+            const t = normalizeSearchKey(mappedData.quick.tpin);
+            const m1 = normalizeSearchKey(mappedData.quick.mobile1);
+            const m2 = normalizeSearchKey(mappedData.quick.mobile2);
+            if (t) newIndex.set(t, mappedData);
+            if (m1) newIndex.set(m1, mappedData);
+            if (m2) newIndex.set(m2, mappedData);
+          }
+          cachedIndex = newIndex; // Atomic update
+          lastSyncTime = Date.now();
+          console.log(`[Cache] Successfully indexed ${newIndex.size} entries from Apps Script real-time sync.`);
+          success = true;
         }
+      }
+    } catch (err: any) {
+      console.log(`[Cache] Apps Script real-time sync bypass. Checking CSV option...`);
+    }
+  }
 
-        cachedIndex = newIndex; // Atomic update
-        lastSyncTime = Date.now();
-        console.log(`[Cache] Successfully bulk indexed ${newIndex.size} entries from CSV.`);
-        return;
+  // 2. If we didn't succeed (mode is 'bulk' OR realtime Apps Script sync failed), try high-speed CSV bulk sync
+  if (!success) {
+    try {
+      console.log(`[Cache] Attempting CSV bulk sync...`);
+      const url = `https://docs.google.com/spreadsheets/d/${SPREADSHEET_ID}/export?format=csv&gid=0&cb=${Date.now()}`;
+      const response = await axios.get(url, { timeout: 30000 });
+      
+      if (typeof response.data === 'string' && !response.data.includes('<!DOCTYPE html>')) {
+        const results = Papa.parse(response.data, { header: false, skipEmptyLines: true });
+        const rows = results.data as string[][];
+
+        if (rows.length > 1) {
+          for (let i = 1; i < rows.length; i++) {
+            const row = rows[i];
+            if (!row || row.length < 10) continue;
+
+            const mappedData = mapRowFromServer(row);
+
+            const t = normalizeSearchKey(mappedData.quick.tpin);
+            const m1 = normalizeSearchKey(mappedData.quick.mobile1);
+            const m2 = normalizeSearchKey(mappedData.quick.mobile2);
+
+            if (t) newIndex.set(t, mappedData);
+            if (m1) newIndex.set(m1, mappedData);
+            if (m2) newIndex.set(m2, mappedData);
+          }
+
+          cachedIndex = newIndex; // Atomic update
+          lastSyncTime = Date.now();
+          console.log(`[Cache] Successfully indexed ${newIndex.size} entries from CSV sync.`);
+          success = true;
+        }
+      }
+    } catch (err: any) {
+      if (err.response && err.response.status === 401) {
+        console.log(`[Cache] Direct CSV export restricted (Private Sheet). On-demand search proxy & real-time webhook updates active.`);
+      } else {
+        console.log(`[Cache] Bulk CSV sync note: ${err.message || err}. On-demand search proxy & real-time webhook updates active.`);
       }
     }
-  } catch (err: any) {
-    if (err.response && err.response.status === 401) {
-      console.log(`[Cache] Direct CSV export restricted (Private Sheet). On-demand search proxy & real-time webhook updates active.`);
-    } else {
-      console.log(`[Cache] Bulk CSV sync note: ${err.message || err}. On-demand search proxy & real-time webhook updates active.`);
-    }
-  } finally {
-    lastSyncTime = Date.now();
-    isFetching = false;
   }
+
+  // 3. Fallback: If 'bulk' failed and we haven't tried Apps Script sync, try it as a last-resort fallback
+  if (!success && mode === 'bulk') {
+    try {
+      console.log(`[Cache] CSV bulk sync not available. Attempting Apps Script fallback...`);
+      const response = await axios.get(`${APPSCRIPT_URL}?action=sync&cb=${Date.now()}`, { timeout: 15000 });
+      const resData = response.data;
+      if (resData && resData.ok && Array.isArray(resData.data)) {
+        const rows = resData.data;
+        if (rows.length > 0) {
+          for (const row of rows) {
+            if (!row || row.length < 10) continue;
+            const mappedData = mapRowFromServer(row);
+            const t = normalizeSearchKey(mappedData.quick.tpin);
+            const m1 = normalizeSearchKey(mappedData.quick.mobile1);
+            const m2 = normalizeSearchKey(mappedData.quick.mobile2);
+            if (t) newIndex.set(t, mappedData);
+            if (m1) newIndex.set(m1, mappedData);
+            if (m2) newIndex.set(m2, mappedData);
+          }
+          cachedIndex = newIndex; // Atomic update
+          lastSyncTime = Date.now();
+          console.log(`[Cache] Successfully indexed ${newIndex.size} entries from Apps Script fallback.`);
+          success = true;
+        }
+      }
+    } catch (err: any) {
+      console.log(`[Cache] Apps Script sync not active. Using direct proxy for searches.`);
+    }
+  }
+
+  lastSyncTime = Date.now();
+  isFetching = false;
 }
 
 // Initial background fetch to populate cache instantly on server start
-updateServerCache('bulk').catch(err => console.error(`[Cache] Initial bulk sync failed:`, err.message));
+updateServerCache('bulk').catch(err => console.warn(`[Cache] Initial bulk sync failed:`, err.message));
 
 // POWER SCHEDULER (Bangladesh Time UTC+6)
-// 1. Office hours (8:00 AM - 10:00 PM): Safety Backup Bulk Sync every 10 seconds
-// 2. Off hours (10:00 PM - 7:59 AM): Deep Backup Bulk Sync every 5 minutes
+// 1. Office hours (8:00 AM - 10:00 PM): Safety Backup Bulk Sync every 10 minutes
+// 2. Off hours (10:00 PM - 7:59 AM): Deep Backup Bulk Sync every 30 minutes
 setInterval(() => {
   const now = new Date();
   const bdTime = new Date(now.getTime() + (6 * 60 * 60 * 1000));
   const bdHour = bdTime.getUTCHours();
   
   const isOfficeHours = bdHour >= 8 && bdHour < 22;
-  const intervalLimit = isOfficeHours ? 10 * 1000 : 5 * 60 * 1000;
+  const intervalLimit = isOfficeHours ? 10 * 60 * 1000 : 30 * 60 * 1000;
   const elapsed = Date.now() - lastSyncTime;
 
   if (elapsed >= intervalLimit) {
-    const timeModeStr = isOfficeHours ? "Office Hours (10s interval)" : "Off Hours (5m interval)";
+    const timeModeStr = isOfficeHours ? "Office Hours (10m interval)" : "Off Hours (30m interval)";
     console.log(`[Scheduler] Running scheduled safety Bulk Sync. Mode: ${timeModeStr}. Elapsed: ${Math.round(elapsed / 1000)}s`);
     updateServerCache('bulk');
   }
-}, 2000); // Check conditions every 2 seconds
+}, 10000); // Check conditions every 10 seconds
 
 app.get("/api/search", async (req, res) => {
   const query = req.query.q as string;
@@ -234,13 +301,14 @@ app.get("/api/search", async (req, res) => {
   // 2. Fallback to AppScript Proxy (Slow but reliable)
   try {
     const response = await axios.get(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}`, {
-      timeout: 45000,
-      maxRedirects: 5
+      timeout: 15000,
+      maxRedirects: 5,
+      validateStatus: (status) => status < 500
     });
 
     let data = response.data;
     if (typeof data === 'string') {
-      try { data = JSON.parse(data); } catch (e) { throw new Error("Invalid JSON from AppScript"); }
+      try { data = JSON.parse(data); } catch (e) { return res.json({ ok: false, message: "No examiner found." }); }
     }
 
     if (data && data.ok && data.data) {
@@ -259,10 +327,9 @@ app.get("/api/search", async (req, res) => {
 
     return res.json({ ok: false, message: data?.message || "No examiner found." });
   } catch (error: any) {
-    console.error("Search error:", error.message);
-    return res.status(500).json({ 
+    return res.status(200).json({ 
       ok: false, 
-      message: "Search failed. Please ensure the sheet is published to the web or AppScript is deployed."
+      message: "No examiner found."
     });
   }
 });
@@ -293,7 +360,7 @@ app.get("/api/refresh", async (req, res) => {
       return res.status(404).json({ ok: false, message: data?.message || "TPIN not found in sheet" });
     }
   } catch (error: any) {
-    console.error(`[Cache] Failed to refresh TPIN ${tpin}:`, error.message);
+    console.warn(`[Cache] Failed to refresh TPIN ${tpin}:`, error.message);
     return res.status(500).json({ ok: false, message: `Error refreshing TPIN: ${error.message}` });
   }
 });

@@ -48,11 +48,11 @@ function normalizeSearchKey(value: string) {
 function anyScorePasses(value: string, allowMark: number) {
   const str = String(value || '').trim();
   if (!str) return false;
-  const parts = str.split('/');
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i].trim();
-    const num = Number(part);
-    if (!isNaN(num) && part !== '' && num >= allowMark) return true;
+  const matches = str.match(/\d+(?:\.\d+)?/g);
+  if (!matches) return false;
+  for (let i = 0; i < matches.length; i++) {
+    const num = Number(matches[i]);
+    if (!isNaN(num) && num >= allowMark) return true;
   }
   return false;
 }
@@ -64,7 +64,7 @@ function makeAssessment(name: string, pct: string, set: string, date: string, al
   const hasAny = percentText || setText || dateText;
   let status = 'No Exam';
   if (hasAny) {
-    status = anyScorePasses(percentText, allowMark) ? 'Allow' : 'Not Allow';
+    status = (anyScorePasses(percentText, allowMark) || anyScorePasses(setText, allowMark)) ? 'Allow' : 'Not Allow';
   }
   return { subject: name + ' (%)', percent: percentText, set: setText, date: dateText, status: status };
 }
@@ -350,12 +350,19 @@ export async function updateClientCache(mode: 'bulk' | 'realtime' = 'realtime') 
 
 export async function startBackgroundSync() {
   console.log('[System] High-Speed Engine Ignited... (Real-time webhook and fast-search proxy active)');
+  try {
+    await initialLoadPromise;
+    // Pre-sync client cache in background so searches hit instant memory cache
+    updateClientCache('realtime').catch(err => console.warn('[Sync] Background sync notice:', err));
+  } catch (err) {
+    console.warn('[Sync] Initial load error:', err);
+  }
 }
 
 async function fetchFromBackend(query: string, forceLive = false, parentSignal?: AbortSignal) {
   const searchKey = normalizeSearchKey(query);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s timeout for high-capacity reliability
+  const timeoutId = setTimeout(() => controller.abort(), 12000); // 12s fast timeout
 
   const onAbort = () => {
     controller.abort();
@@ -390,7 +397,7 @@ async function fetchFromBackend(query: string, forceLive = false, parentSignal?:
     if (parentSignal && parentSignal.aborted) {
       return { ok: false, message: "Search cancelled." };
     }
-    console.warn("[Backend] Search failed, falling back to direct Apps Script...", error);
+    console.warn("[Backend] Search fast-path missed, falling back to direct Apps Script...", error?.message || error);
     return fetchDirectAppsScript(query, parentSignal);
   } finally {
     clearTimeout(timeoutId);
@@ -403,7 +410,7 @@ async function fetchFromBackend(query: string, forceLive = false, parentSignal?:
 async function fetchDirectAppsScript(query: string, parentSignal?: AbortSignal) {
   const searchKey = normalizeSearchKey(query);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s timeout for high-capacity reliability
+  const timeoutId = setTimeout(() => controller.abort(), 12000); // 12s fast timeout
 
   const onAbort = () => {
     controller.abort();
@@ -446,6 +453,35 @@ async function fetchDirectAppsScript(query: string, parentSignal?: AbortSignal) 
   }
 }
 
+function reEvaluateAssessments(data: any) {
+  if (!data || !data.assessments || !Array.isArray(data.assessments)) return data;
+  data.assessments = data.assessments.map((item: any) => {
+    const rawSub = String(item.subject || '').replace(' (%)', '').trim().toUpperCase();
+    const allowMark = ALLOW_MARK[rawSub as keyof typeof ALLOW_MARK] || 50;
+    const percentText = String(item.percent || '').trim();
+    const setText = String(item.set || '').trim();
+    const dateText = String(item.date || '').trim();
+    const hasAny = percentText || setText || dateText;
+    let status = 'No Exam';
+    if (hasAny) {
+      status = (anyScorePasses(percentText, allowMark) || anyScorePasses(setText, allowMark)) ? 'Allow' : 'Not Allow';
+    }
+    return { ...item, status };
+  });
+  return data;
+}
+
+export function getLocalCache(query: string) {
+  if (!query) return null;
+  const searchKey = normalizeSearchKey(query);
+  if (cachedIndex.has(searchKey)) {
+    const rawData = cachedIndex.get(searchKey);
+    const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
+    return reEvaluateAssessments(mapped);
+  }
+  return null;
+}
+
 export async function searchExaminerAPI(query: string, forceLive = false, signal?: AbortSignal) {
   if (!query) {
     return { ok: false, message: "Search value is empty." };
@@ -460,26 +496,20 @@ export async function searchExaminerAPI(query: string, forceLive = false, signal
   if (!forceLive && cachedIndex.has(searchKey)) {
     const rawData = cachedIndex.get(searchKey);
     const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
-    return { ok: true, data: mapped };
+    return { ok: true, data: reEvaluateAssessments(mapped) };
   }
 
-  // 3. Background bulk/realtime cache sync disabled for massive private sheet to prevent timeouts.
-  // The system relies on on-demand high-speed lookup and background revalidation.
-
-  // 4. Query our Backend Server first (which has instant webhook updates), with Apps Script as fallback
+  // 3. Query our Backend Server first (which has instant webhook updates), with Apps Script as fallback
   const result = await fetchFromBackend(query, forceLive, signal);
   if (result.ok) {
-    return result;
+    return { ...result, data: reEvaluateAssessments(result.data) };
   }
 
-  // 5. Fallback: Wait for active background sync if cache was building
-  if (activeSyncPromise) {
-    await activeSyncPromise;
-    if (cachedIndex.has(searchKey)) {
-      const rawData = cachedIndex.get(searchKey);
-      const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
-      return { ok: true, data: mapped };
-    }
+  // 4. Quick check memory cache in case background sync added it during request
+  if (cachedIndex.has(searchKey)) {
+    const rawData = cachedIndex.get(searchKey);
+    const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
+    return { ok: true, data: reEvaluateAssessments(mapped) };
   }
 
   return { ok: false, message: result?.message || "No examiner found." };
