@@ -362,7 +362,7 @@ export async function startBackgroundSync() {
 async function fetchFromBackend(query: string, forceLive = false, parentSignal?: AbortSignal) {
   const searchKey = normalizeSearchKey(query);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 12000); // 12s fast timeout
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s safe timeout for multi-device sync
 
   const onAbort = () => {
     controller.abort();
@@ -383,21 +383,29 @@ async function fetchFromBackend(query: string, forceLive = false, parentSignal?:
       signal: controller.signal,
       referrerPolicy: 'no-referrer'
     });
+
+    const contentType = response.headers.get('content-type') || '';
+    if (!response.ok || contentType.includes('text/html')) {
+      // If deployed on static Vercel (where /api returned index.html) or 404/500, fallback to direct Apps Script
+      console.warn("[Backend] Response is HTML or not OK, falling back to direct Apps Script...");
+      return fetchDirectAppsScript(query, parentSignal);
+    }
+
     const result = await response.json();
 
     if (result && result.ok && result.data) {
       // Store in memory cache for instant future lookup
       cachedIndex.set(searchKey, result.data);
-      // Persist to IndexedDB immediately so it is available offline / next session
       savePersistentCache().catch(err => console.error('[IndexedDB] Persistent save error:', err));
       return { ok: true, data: result.data };
     }
+
     return { ok: false, message: result?.message || "No examiner found." };
   } catch (error: any) {
     if (parentSignal && parentSignal.aborted) {
       return { ok: false, message: "Search cancelled." };
     }
-    console.warn("[Backend] Search fast-path missed, falling back to direct Apps Script...", error?.message || error);
+    console.warn("[Backend] Backend search missed, falling back to direct Apps Script...", error?.message || error);
     return fetchDirectAppsScript(query, parentSignal);
   } finally {
     clearTimeout(timeoutId);
@@ -410,7 +418,7 @@ async function fetchFromBackend(query: string, forceLive = false, parentSignal?:
 async function fetchDirectAppsScript(query: string, parentSignal?: AbortSignal) {
   const searchKey = normalizeSearchKey(query);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 12000); // 12s fast timeout
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s safe timeout
 
   const onAbort = () => {
     controller.abort();
@@ -426,16 +434,15 @@ async function fetchDirectAppsScript(query: string, parentSignal?: AbortSignal) 
   }
 
   try {
-    const response = await fetch(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}`, { 
+    const response = await fetch(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}&cb=${Date.now()}`, { 
       signal: controller.signal,
       referrerPolicy: 'no-referrer'
     });
     const result = await response.json();
 
-    if (result && result.ok) {
+    if (result && result.ok && result.data) {
       // Store in memory cache for instant future lookup
       cachedIndex.set(searchKey, result.data);
-      // Persist to IndexedDB immediately so it is available offline / next session
       savePersistentCache().catch(err => console.error('[IndexedDB] Persistent save error:', err));
       return { ok: true, data: result.data };
     }
@@ -482,9 +489,16 @@ export function getLocalCache(query: string) {
   return null;
 }
 
-export async function searchExaminerAPI(query: string, forceLive = false, signal?: AbortSignal) {
+export interface SearchResult {
+  ok: boolean;
+  data?: any;
+  message?: string;
+  isFallback?: boolean;
+}
+
+export async function searchExaminerAPI(query: string, forceLive = true, signal?: AbortSignal): Promise<SearchResult> {
   if (!query) {
-    return { ok: false, message: "Search value is empty." };
+    return { ok: false, data: null, message: "Search value is empty." };
   }
 
   const searchKey = normalizeSearchKey(query);
@@ -492,25 +506,18 @@ export async function searchExaminerAPI(query: string, forceLive = false, signal
   // 1. Ensure initial load from local IndexedDB cache is done
   await initialLoadPromise;
 
-  // 2. INSTANT SEARCH: If data exists in local IndexedDB / RAM cache, return immediately (0.001s)
-  if (!forceLive && cachedIndex.has(searchKey)) {
-    const rawData = cachedIndex.get(searchKey);
-    const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
-    return { ok: true, data: reEvaluateAssessments(mapped) };
-  }
-
-  // 3. Query our Backend Server first (which has instant webhook updates), with Apps Script as fallback
+  // 2. Query our Backend Server for 100% accurate, live real-time Google Sheet data
   const result = await fetchFromBackend(query, forceLive, signal);
-  if (result.ok) {
+  if (result.ok && result.data) {
+    // Keep local cache in sync with latest live state
+    cachedIndex.set(searchKey, result.data);
     return { ...result, data: reEvaluateAssessments(result.data) };
   }
 
-  // 4. Quick check memory cache in case background sync added it during request
-  if (cachedIndex.has(searchKey)) {
-    const rawData = cachedIndex.get(searchKey);
-    const mapped = Array.isArray(rawData) ? mapRawRow(rawData) : rawData;
-    return { ok: true, data: reEvaluateAssessments(mapped) };
+  // 3. If examiner was not found in Google Sheets, clear any stale local cache
+  if (searchKey) {
+    cachedIndex.delete(searchKey);
   }
 
-  return { ok: false, message: result?.message || "No examiner found." };
+  return { ok: false, data: null, message: result?.message || "No examiner found." };
 }

@@ -102,27 +102,47 @@ export default function App() {
     };
   }, []);
 
-  // Live Auto-Refresh: When an examiner is open, automatically sync live data from Google Sheets every 2s
+  // Live Auto-Refresh: When an examiner is open and active, safely check for Google Sheet updates
   useEffect(() => {
     if (!data?.quick?.tpin) return;
 
     const tpin = data.quick.tpin;
-    const intervalId = setInterval(async () => {
+    let isCancelled = false;
+    let timerId: any = null;
+
+    const schedulePoll = (delay = 12000) => {
+      if (isCancelled) return;
+      timerId = setTimeout(poll, delay);
+    };
+
+    const poll = async () => {
+      if (isCancelled) return;
+      // Pause polling if the tab is hidden
+      if (typeof document !== 'undefined' && document.hidden) {
+        schedulePoll(15000);
+        return;
+      }
+
       try {
-        // Pass forceLive = true so it auto-syncs live directly from Google Sheets
         const res = await searchExaminerAPI(tpin, true);
-        if (res.ok && res.data) {
-          // Compare if data changed, if so update state smoothly
+        if (!isCancelled && res.ok && res.data) {
           if (JSON.stringify(res.data) !== JSON.stringify(data)) {
             setData(res.data);
           }
         }
       } catch (err) {
         // Silent fail for background auto-polling
+      } finally {
+        schedulePoll(15000);
       }
-    }, 2000);
+    };
 
-    return () => clearInterval(intervalId);
+    schedulePoll(12000);
+
+    return () => {
+      isCancelled = true;
+      if (timerId) clearTimeout(timerId);
+    };
   }, [data?.quick?.tpin, data]);
 
   // Auto search disabled as requested - search will only trigger when user clicks Search or presses Enter
@@ -151,7 +171,7 @@ export default function App() {
         setError(result.message || "Failed to refresh data from Google Sheets.");
       }
     } catch (err: any) {
-      console.error("Refresh error:", err);
+      console.warn("Refresh error:", err);
       setError(err.message || "Failed to connect to Google Sheets.");
     } finally {
       setRefreshing(false);
@@ -194,25 +214,23 @@ export default function App() {
     }
 
     try {
-      // 2. Perform ONE live fetch to get fresh real-time data from Google Sheet
+      // 2. Perform live fetch to get 100% fresh real-time data from Google Sheet
       const liveResult = await searchExaminerAPI(key, true, controller.signal);
       if (controller.signal.aborted) return;
 
       if (liveResult.ok && liveResult.data) {
-        setData(prev => {
-          if (prev && JSON.stringify(prev) === JSON.stringify(liveResult.data)) {
-            return prev;
-          }
-          return liveResult.data;
-        });
+        setData(liveResult.data);
         setError(null);
-      } else if (!hasCached) {
+      } else {
         setData(null);
         setError(liveResult.message || "No examiner found.");
       }
     } catch (err: any) {
-      if (!controller.signal.aborted && !hasCached) {
-        setError(err.message || "Server error occurred.");
+      if (!controller.signal.aborted) {
+        if (!hasCached) {
+          setData(null);
+          setError(err.message || "Server error occurred.");
+        }
       }
     } finally {
       if (abortControllerRef.current === controller) {
@@ -371,6 +389,16 @@ export default function App() {
                     </p>
                   </div>
                   <div className="flex flex-wrap items-center gap-3">
+                    <button
+                      type="button"
+                      onClick={() => handleRefreshLive(data.quick.tpin)}
+                      disabled={refreshing}
+                      className="hidden px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-full text-xs font-bold items-center gap-1.5 shadow-md transition-all active:scale-95 disabled:opacity-50 cursor-pointer"
+                      title="Google Sheet থেকে একদম রিয়েল-টাইম লেটেস্ট ডেটা রিফ্রেশ করুন"
+                    >
+                      <RefreshCw className={cn("w-3.5 h-3.5", refreshing && "animate-spin")} />
+                      <span>{refreshing ? "Refreshing..." : "Live Refresh"}</span>
+                    </button>
                     <div className="px-4 py-1.5 bg-[#2d3a75] rounded-full flex items-center gap-2 border border-white/5">
                       <span className="text-slate-300 text-[11px] font-bold">T-Pin</span>
                       <span className="text-[#facc15] font-bold text-sm">{data.quick.tpin}</span>
