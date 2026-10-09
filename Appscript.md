@@ -142,9 +142,15 @@ function syncAllData() {
   return { ok: true, data: filtered };
 }
 
+function convertBanglaDigits_(s) {
+  var b = ['০','১','২','৩','৪','৫','৬','৭','৮','৯'];
+  return String(s || '').replace(/[০-৯]/g, function(d) { return b.indexOf(d); });
+}
+
 function norm_(v) {
-  v = String(v || '').trim();
+  v = convertBanglaDigits_(String(v || '').trim());
   if (!v) return '';
+  v = v.replace(/^tpin[:\s\-_#]*/i, '').trim();
   var d = v.replace(/\D/g, '');
   if (d) {
     if (d.length >= 12 && d.slice(0,3) === '880') return d;
@@ -156,11 +162,11 @@ function norm_(v) {
 }
 
 function searchExaminer(query) {
-  query = String(query || '').trim();
-  if (!query) return { ok: false, message: 'Search value is empty.' };
+  query = convertBanglaDigits_(String(query || '').trim());
+  if (!query) return { ok: false, notFound: true, message: 'Search value is empty.' };
 
   var key = norm_(query);
-  if (!key) return { ok: false, message: 'Invalid search key.' };
+  if (!key) return { ok: false, notFound: true, message: 'Invalid search key.' };
 
   var ss;
   try {
@@ -173,7 +179,7 @@ function searchExaminer(query) {
   if (!sheet) throw new Error('Sheet not found: ' + CONFIG.SHEET_NAME);
 
   var lastRow = sheet.getLastRow();
-  if (lastRow < CONFIG.DATA_START_ROW) return { ok: false, message: 'No data found in sheet' };
+  if (lastRow < CONFIG.DATA_START_ROW) return { ok: false, notFound: true, message: 'No data found in sheet' };
 
   var numRows = lastRow - CONFIG.DATA_START_ROW + 1;
   var foundRow = -1;
@@ -198,52 +204,41 @@ function searchExaminer(query) {
     if (val && searchList.indexOf(val) === -1) searchList.push(val);
   }
 
-  // STEP 1: Ultra-fast exact match via Sheet TextFinder (< 100ms via Google C++ search engine)
+  // STEP 1: Ultra-fast exact match via Column D (TPIN) & Columns J:K (Mobile) (< 100ms)
   for (var s = 0; s < searchList.length; s++) {
     var term = searchList[s];
-    // Always check TPIN column
-    var fTpin = sheet.getRange(CONFIG.DATA_START_ROW, COL.TPIN, numRows, 1)
-      .createTextFinder(term).matchEntireCell(true).findNext();
-    if (fTpin) { foundRow = fTpin.getRow(); break; }
-
-    // Only search Mobile columns if query looks like phone number or >= 7 digits
-    if (isPhone || term.length >= 7) {
-      var fM1 = sheet.getRange(CONFIG.DATA_START_ROW, COL.MOBILE_1, numRows, 1)
-        .createTextFinder(term).matchEntireCell(true).findNext();
-      if (fM1) { foundRow = fM1.getRow(); break; }
-
-      var fM2 = sheet.getRange(CONFIG.DATA_START_ROW, COL.MOBILE_2, numRows, 1)
-        .createTextFinder(term).matchEntireCell(true).findNext();
-      if (fM2) { foundRow = fM2.getRow(); break; }
+    // Always check TPIN column (Column D)
+    var fTpin = sheet.getRange("D:D").createTextFinder(term).matchEntireCell(true).findNext();
+    if (fTpin && fTpin.getRow() >= CONFIG.DATA_START_ROW) {
+      foundRow = fTpin.getRow();
+      break;
     }
-  }
 
-  // STEP 2: Fast memory scan only if needed (e.g. custom cell formatting)
-  if (foundRow === -1 && (isPhone || query.length >= 3)) {
-    // 1. Check TPIN column
-    var tpinCol = sheet.getRange(CONFIG.DATA_START_ROW, COL.TPIN, numRows, 1).getValues();
-    for (var r = 0; r < numRows; r++) {
-      var tVal = String(tpinCol[r][0]).trim();
-      if (tVal === query || tVal === key) {
-        foundRow = r + CONFIG.DATA_START_ROW;
+    // Only search Mobile columns (J:K) if query looks like phone number or >= 7 digits
+    if (isPhone || term.length >= 7) {
+      var fMob = sheet.getRange("J:K").createTextFinder(term).matchEntireCell(true).findNext();
+      if (fMob && fMob.getRow() >= CONFIG.DATA_START_ROW) {
+        foundRow = fMob.getRow();
         break;
       }
     }
+  }
 
-    // 2. Only check mobile if query is a phone number
-    if (foundRow === -1 && isPhone) {
-      var mRange = sheet.getRange(CONFIG.DATA_START_ROW, COL.MOBILE_1, numRows, 2).getValues();
-      for (var r = 0; r < numRows; r++) {
-        if (norm_(mRange[r][0]) === key || norm_(mRange[r][1]) === key) {
-          foundRow = r + CONFIG.DATA_START_ROW;
-          break;
-        }
+  // STEP 2: Fast memory scan only for phone numbers with irregular formatting
+  if (foundRow === -1 && isPhone) {
+    var mRange = sheet.getRange(CONFIG.DATA_START_ROW, COL.MOBILE_1, numRows, 2).getValues();
+    for (var r = 0; r < numRows; r++) {
+      var m1 = String(mRange[r][0] || '').replace(/\D/g, '');
+      var m2 = String(mRange[r][1] || '').replace(/\D/g, '');
+      if (m1 === key || m2 === key || ('88' + m1 === key) || ('880' + m1 === key)) {
+        foundRow = r + CONFIG.DATA_START_ROW;
+        break;
       }
     }
   }
 
   if (foundRow === -1) {
-    return { ok: false, message: 'No examiner found.' };
+    return { ok: false, notFound: true, message: 'No examiner found.' };
   }
 
   // Read the full single row in one shot (dynamically reads all columns to ensure nothing is missed)

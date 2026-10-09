@@ -222,14 +222,32 @@ export default function App() {
         setData(liveResult.data);
         setError(null);
       } else {
-        setData(null);
-        setError(liveResult.message || "No examiner found.");
+        // If it was a network timeout / connection issue or script glitch and we already had cached data displayed, don't wipe it!
+        if (hasCached) {
+          if (liveResult.notFound === true) {
+            setData(null);
+            setError("No examiner found.");
+          } else {
+            // Keep the cached data visible, do not clear data!
+            setError("Live connection delayed. Displaying saved offline information.");
+          }
+        } else {
+          if (liveResult.notFound === true) {
+            setData(null);
+            setError("No examiner found.");
+          } else {
+            setData(null);
+            setError(liveResult.message || "Temporary connection issue with Google Sheets. Please try again.");
+          }
+        }
       }
     } catch (err: any) {
       if (!controller.signal.aborted) {
         if (!hasCached) {
           setData(null);
-          setError(err.message || "Server error occurred.");
+          setError(err.message || "Server error occurred. Please try again.");
+        } else {
+          setError("Live connection delayed. Displaying saved offline information.");
         }
       }
     } finally {
@@ -282,10 +300,14 @@ export default function App() {
                   <input
                     ref={searchInputRef}
                     type="text"
-                    placeholder="Search..."
+                    placeholder="Search...."
                     className="w-full bg-transparent border-none outline-none text-base font-semibold text-slate-800 placeholder:text-slate-300"
                     value={query}
-                    onChange={(e) => setQuery(e.target.value)}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      const converted = val.replace(/[০-৯]/g, (d) => String('০১২৩৪৫৬৭৮৯'.indexOf(d)));
+                      setQuery(converted);
+                    }}
                   />
                   {query && (
                     <button
@@ -394,7 +416,7 @@ export default function App() {
                       onClick={() => handleRefreshLive(data.quick.tpin)}
                       disabled={refreshing}
                       className="hidden px-3 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-full text-xs font-bold items-center gap-1.5 shadow-md transition-all active:scale-95 disabled:opacity-50 cursor-pointer"
-                      title="Google Sheet থেকে একদম রিয়েল-টাইম লেটেস্ট ডেটা রিফ্রেশ করুন"
+                      title="Refresh real-time latest data from Google Sheets"
                     >
                       <RefreshCw className={cn("w-3.5 h-3.5", refreshing && "animate-spin")} />
                       <span>{refreshing ? "Refreshing..." : "Live Refresh"}</span>

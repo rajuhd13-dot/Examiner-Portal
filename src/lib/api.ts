@@ -32,9 +32,15 @@ const ALLOW_MARK = {
   MATH: 50, BIOLOGY: 50, ICT: 50
 };
 
-function normalizeSearchKey(value: string) {
-  value = String(value || '').trim();
+function convertBanglaToEnglishDigits(str: string): string {
+  const banglaDigits = ['০', '১', '২', '৩', '৪', '৫', '৬', '৭', '৮', '৯'];
+  return String(str || '').replace(/[০-৯]/g, (d) => String(banglaDigits.indexOf(d)));
+}
+
+export function normalizeSearchKey(value: string) {
+  value = convertBanglaToEnglishDigits(String(value || '').trim());
   if (!value) return '';
+  value = value.replace(/^tpin[:\s\-_#]*/i, '').trim();
   const digits = value.replace(/\D+/g, '');
   if (digits) {
     if (digits.length >= 12 && digits.indexOf('880') === 0) return digits;
@@ -43,6 +49,23 @@ function normalizeSearchKey(value: string) {
     return digits;
   }
   return value.toUpperCase();
+}
+
+export function setClientCache(resultData: any) {
+  if (!resultData || !resultData.quick) return;
+  const addKeyAliases = (val: string) => {
+    if (!val) return;
+    const norm = normalizeSearchKey(val);
+    if (!norm) return;
+    cachedIndex.set(norm, resultData);
+    if (norm.length === 13 && norm.startsWith('880')) {
+      cachedIndex.set('0' + norm.substring(3), resultData);
+      cachedIndex.set(norm.substring(3), resultData);
+    }
+  };
+  addKeyAliases(resultData.quick.tpin);
+  addKeyAliases(resultData.quick.mobile1);
+  addKeyAliases(resultData.quick.mobile2);
 }
 
 function anyScorePasses(value: string, allowMark: number) {
@@ -359,10 +382,10 @@ export async function startBackgroundSync() {
   }
 }
 
-async function fetchFromBackend(query: string, forceLive = false, parentSignal?: AbortSignal) {
+async function fetchFromBackend(query: string, forceLive = false, parentSignal?: AbortSignal): Promise<SearchResult> {
   const searchKey = normalizeSearchKey(query);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s safe timeout for multi-device sync
+  const timeoutId = setTimeout(() => controller.abort(), 42000); // 42s timeout
 
   const onAbort = () => {
     controller.abort();
@@ -385,27 +408,46 @@ async function fetchFromBackend(query: string, forceLive = false, parentSignal?:
     });
 
     const contentType = response.headers.get('content-type') || '';
-    if (!response.ok || contentType.includes('text/html')) {
-      // If deployed on static Vercel (where /api returned index.html) or 404/500, fallback to direct Apps Script
-      console.warn("[Backend] Response is HTML or not OK, falling back to direct Apps Script...");
+    if (contentType.includes('text/html')) {
+      // If backend returned HTML (static routing fallback)
+      return fetchDirectAppsScript(query, parentSignal);
+    }
+
+    if (!response.ok) {
+      // Server returned an error (e.g. 503 network timeout with Google Apps Script)
+      // Try direct fetch to Google Apps script as fallback
+      console.log(`[Backend] Backend status ${response.status}, trying direct Apps Script fallback...`);
       return fetchDirectAppsScript(query, parentSignal);
     }
 
     const result = await response.json();
 
     if (result && result.ok && result.data) {
-      // Store in memory cache for instant future lookup
-      cachedIndex.set(searchKey, result.data);
+      // Store in memory cache for instant future lookup across all aliases
+      setClientCache(result.data);
       savePersistentCache().catch(err => console.error('[IndexedDB] Persistent save error:', err));
       return { ok: true, data: result.data };
     }
 
-    return { ok: false, message: result?.message || "No examiner found." };
+    return { 
+      ok: false, 
+      notFound: result?.notFound === true,
+      message: result?.message || "No examiner found." 
+    };
   } catch (error: any) {
     if (parentSignal && parentSignal.aborted) {
       return { ok: false, message: "Search cancelled." };
     }
-    console.warn("[Backend] Backend search missed, falling back to direct Apps Script...", error?.message || error);
+    if (error?.name === 'AbortError') {
+      // Timed out waiting for backend
+      if (cachedIndex.has(searchKey)) {
+        const cached = cachedIndex.get(searchKey);
+        const mapped = Array.isArray(cached) ? mapRawRow(cached) : cached;
+        return { ok: true, data: mapped, isFallback: true };
+      }
+      return { ok: false, notFound: true, message: "No examiner found." };
+    }
+    console.log("[Backend] Direct Apps Script fallback activated.");
     return fetchDirectAppsScript(query, parentSignal);
   } finally {
     clearTimeout(timeoutId);
@@ -415,10 +457,10 @@ async function fetchFromBackend(query: string, forceLive = false, parentSignal?:
   }
 }
 
-async function fetchDirectAppsScript(query: string, parentSignal?: AbortSignal) {
+async function fetchDirectAppsScript(query: string, parentSignal?: AbortSignal): Promise<SearchResult> {
   const searchKey = normalizeSearchKey(query);
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30s safe timeout
+  const timeoutId = setTimeout(() => controller.abort(), 40000); // 40s timeout
 
   const onAbort = () => {
     controller.abort();
@@ -442,16 +484,43 @@ async function fetchDirectAppsScript(query: string, parentSignal?: AbortSignal) 
 
     if (result && result.ok && result.data) {
       // Store in memory cache for instant future lookup
-      cachedIndex.set(searchKey, result.data);
+      setClientCache(result.data);
       savePersistentCache().catch(err => console.error('[IndexedDB] Persistent save error:', err));
       return { ok: true, data: result.data };
     }
-    return { ok: false, message: result?.message || "No examiner found." };
+
+    const msg = String(result?.message || '').toLowerCase();
+    const isScriptError = msg.includes('script error') || msg.includes('timed out') || msg.includes('quota') || msg.includes('lock') || msg.includes('exceeded') || msg.includes('exception');
+    if (isScriptError) {
+      if (cachedIndex.has(searchKey)) {
+        const cached = cachedIndex.get(searchKey);
+        const mapped = Array.isArray(cached) ? mapRawRow(cached) : cached;
+        return { ok: true, data: mapped, isFallback: true };
+      }
+      return { ok: false, networkError: true, message: "Temporary connection issue with Google Sheets. Please click Search again." };
+    }
+
+    return { ok: false, notFound: true, message: result?.message || "No examiner found." };
   } catch (error: any) {
     if (parentSignal && parentSignal.aborted) {
       return { ok: false, message: "Search cancelled." };
     }
-    return { ok: false, message: "No examiner found." };
+    if (error?.name === 'AbortError') {
+      // Apps Script only hangs or takes >40s when record is not in sheet
+      if (cachedIndex.has(searchKey)) {
+        const cached = cachedIndex.get(searchKey);
+        const mapped = Array.isArray(cached) ? mapRawRow(cached) : cached;
+        return { ok: true, data: mapped, isFallback: true };
+      }
+      return { ok: false, notFound: true, message: "No examiner found." };
+    }
+    // If we have an existing cached entry for this key, keep and use it!
+    if (cachedIndex.has(searchKey)) {
+      const cached = cachedIndex.get(searchKey);
+      const mapped = Array.isArray(cached) ? mapRawRow(cached) : cached;
+      return { ok: true, data: mapped, isFallback: true };
+    }
+    return { ok: false, networkError: true, message: "Temporary connection issue with Google Sheets. Please click Search again." };
   } finally {
     clearTimeout(timeoutId);
     if (parentSignal) {
@@ -494,6 +563,9 @@ export interface SearchResult {
   data?: any;
   message?: string;
   isFallback?: boolean;
+  isCached?: boolean;
+  notFound?: boolean;
+  networkError?: boolean;
 }
 
 export async function searchExaminerAPI(query: string, forceLive = true, signal?: AbortSignal): Promise<SearchResult> {
@@ -510,14 +582,27 @@ export async function searchExaminerAPI(query: string, forceLive = true, signal?
   const result = await fetchFromBackend(query, forceLive, signal);
   if (result.ok && result.data) {
     // Keep local cache in sync with latest live state
-    cachedIndex.set(searchKey, result.data);
+    setClientCache(result.data);
     return { ...result, data: reEvaluateAssessments(result.data) };
   }
 
-  // 3. If examiner was not found in Google Sheets, clear any stale local cache
-  if (searchKey) {
+  // 3. ONLY clear local cache if Google Sheets explicitly confirmed the examiner is not found, NOT on network timeouts or hiccups!
+  if (result.notFound === true && searchKey && !result.networkError) {
     cachedIndex.delete(searchKey);
   }
 
-  return { ok: false, data: null, message: result?.message || "No examiner found." };
+  // 4. If search encountered a network/timeout error but we have valid local cached data, fallback to it gracefully
+  if ((result.networkError || !result.ok) && cachedIndex.has(searchKey)) {
+    const cached = cachedIndex.get(searchKey);
+    const mapped = Array.isArray(cached) ? mapRawRow(cached) : cached;
+    return { ok: true, data: reEvaluateAssessments(mapped), isFallback: true };
+  }
+
+  return { 
+    ok: false, 
+    data: null, 
+    notFound: result.notFound,
+    networkError: result.networkError,
+    message: result.message || "No examiner found." 
+  };
 }

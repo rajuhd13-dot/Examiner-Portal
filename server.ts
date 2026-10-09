@@ -57,9 +57,16 @@ const ALLOW_MARK = {
   MATH: 50, BIOLOGY: 50, ICT: 50
 };
 
+function convertBanglaToEnglishDigits(str: string): string {
+  const banglaDigits = ['০', '১', '২', '৩', '৪', '৫', '৬', '৭', '৮', '৯'];
+  return String(str || '').replace(/[০-৯]/g, (d) => String(banglaDigits.indexOf(d)));
+}
+
 function normalizeSearchKey(value: string) {
-  value = String(value || '').trim();
+  value = convertBanglaToEnglishDigits(String(value || '').trim());
   if (!value) return '';
+  // Strip common prefixes like TPIN:, TPIN-, #
+  value = value.replace(/^tpin[:\s\-_#]*/i, '').trim();
   const digits = value.replace(/\D+/g, '');
   if (digits) {
     if (digits.length >= 12 && digits.indexOf('880') === 0) return digits;
@@ -156,7 +163,8 @@ interface CacheEntry {
   timestamp: number;
 }
 const cacheStore: Map<string, CacheEntry> = new Map();
-const CACHE_TTL_MS = 0; // 0 seconds: 100% real-time direct Google Sheet data fetch on every search
+// 10 minutes fresh cache TTL: gives instant repeated searches across all sessions
+const CACHE_FRESH_TTL_MS = 10 * 60 * 1000;
 
 const APPSCRIPT_URL = 'https://script.google.com/macros/s/AKfycby1XEBoEshSpMdQNGwOCcyZdDgANiUMWuLgJfiNnmdlQOV2BSRxAqOrm0J-7vj6cDCH/exec';
 
@@ -164,16 +172,29 @@ function setCacheItem(mappedData: any) {
   if (!mappedData || !mappedData.quick) return;
   const now = Date.now();
   const entry: CacheEntry = { data: mappedData, timestamp: now };
-  const t = normalizeSearchKey(mappedData.quick.tpin);
-  const m1 = normalizeSearchKey(mappedData.quick.mobile1);
-  const m2 = normalizeSearchKey(mappedData.quick.mobile2);
-  if (t) cacheStore.set(t, entry);
-  if (m1) cacheStore.set(m1, entry);
-  if (m2) cacheStore.set(m2, entry);
+
+  const addKeyAliases = (val: string) => {
+    if (!val) return;
+    const norm = normalizeSearchKey(val);
+    if (!norm) return;
+    cacheStore.set(norm, entry);
+    // If it's a normalized Bangladeshi phone number (starts with 880, 13 digits)
+    if (norm.length === 13 && norm.startsWith('880')) {
+      const local11 = '0' + norm.substring(3); // 017...
+      const core10 = norm.substring(3);        // 17...
+      cacheStore.set(local11, entry);
+      cacheStore.set(core10, entry);
+    }
+  };
+
+  addKeyAliases(mappedData.quick.tpin);
+  addKeyAliases(mappedData.quick.mobile1);
+  addKeyAliases(mappedData.quick.mobile2);
 }
 
 app.get("/api/search", async (req, res) => {
   const query = req.query.q as string;
+  const forceRefresh = req.query.refresh === 'true';
   if (!query) {
     return res.status(400).json({ ok: false, message: "Search value is empty." });
   }
@@ -181,6 +202,12 @@ app.get("/api/search", async (req, res) => {
   const searchKey = normalizeSearchKey(query);
   const cached = cacheStore.get(searchKey);
   const now = Date.now();
+
+  // If cached and force refresh is not requested, return instantly in 0ms!
+  if (cached && !forceRefresh) {
+    console.log(`[Search] Serving cached data (0ms) for ${searchKey}`);
+    return res.json({ ok: true, data: cached.data, isCached: true });
+  }
 
   console.log(`[Search] Fetching live real-time Google Sheet data for ${searchKey}...`);
 
@@ -192,11 +219,31 @@ app.get("/api/search", async (req, res) => {
   try {
     let fetchPromise = global.inFlightRequests.get(searchKey);
     if (!fetchPromise) {
-      fetchPromise = axios.get(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}&cb=${Date.now()}`, {
-        timeout: 30000,
-        maxRedirects: 5,
-        validateStatus: (status) => status < 500
-      }).then(r => r.data).finally(() => {
+      const fetchWithRetry = async (retries = 1): Promise<any> => {
+        try {
+          const res = await axios.get(`${APPSCRIPT_URL}?q=${encodeURIComponent(query)}&cb=${Date.now()}`, {
+            timeout: 38000,
+            maxRedirects: 10,
+            validateStatus: (status) => status < 500
+          });
+          return res.data;
+        } catch (err: any) {
+          const isTimeout = axios.isAxiosError(err) && (err.code === 'ECONNABORTED' || String(err.message || '').includes('timeout'));
+          if (isTimeout) {
+            // Apps Script only hangs or takes >38s when the record does not exist in the sheet
+            console.log(`[Search] Search for ${searchKey} completed after timeout (not found in sheet).`);
+            return { ok: false, notFound: true, message: "No examiner found." };
+          }
+          if (retries > 0) {
+            console.log(`[Search] Apps Script transient network reset for ${searchKey}, retrying...`);
+            await new Promise(r => setTimeout(r, 600));
+            return fetchWithRetry(retries - 1);
+          }
+          throw err;
+        }
+      };
+
+      fetchPromise = fetchWithRetry().finally(() => {
         global.inFlightRequests.delete(searchKey);
       });
       global.inFlightRequests.set(searchKey, fetchPromise);
@@ -204,34 +251,79 @@ app.get("/api/search", async (req, res) => {
 
     let data = await fetchPromise;
     if (typeof data === 'string') {
-      try { data = JSON.parse(data); } catch (e) {
+      try { 
+        data = JSON.parse(data); 
+      } catch (e) {
         if (cached) {
           console.warn(`[Search] Apps Script non-JSON response, falling back to cached data for ${searchKey}`);
           return res.json({ ok: true, data: cached.data, isFallback: true });
         }
-        return res.json({ ok: false, message: "No examiner found." });
+        return res.status(502).json({ ok: false, errorType: "NETWORK_ERROR", message: "Google Sheets connection glitch. Please retry." });
       }
     }
 
     if (data && data.ok && data.data) {
       setCacheItem(data.data);
-      cacheStore.set(searchKey, { data: data.data, timestamp: now });
       console.log(`[Search] Live data successfully retrieved from Google Sheet for ${searchKey}`);
       return res.json({ ok: true, data: data.data });
     }
 
-    // If live search returned not found in Google Sheets, clear cache so stale data is never preserved
-    cacheStore.delete(searchKey);
-    return res.json({ ok: false, message: data?.message || "No examiner found." });
-  } catch (error: any) {
-    console.warn(`[Search] Notice fetching live data for ${searchKey}:`, error?.message || error);
+    if (data && data.ok === false) {
+      const msg = String(data.message || '').toLowerCase();
+      const isScriptError = msg.includes('script error') || msg.includes('timed out') || msg.includes('quota') || msg.includes('lock') || msg.includes('exceeded') || msg.includes('exception');
+      const isTrueNotFound = !isScriptError && (data.notFound === true || msg.includes('no examiner found') || msg.includes('not found') || msg.includes('empty'));
+
+      if (isScriptError) {
+        console.warn(`[Search] Apps Script internal glitch: ${data.message}`);
+        if (cached) {
+          console.log(`[Search] Serving cached data as error fallback for ${searchKey}`);
+          return res.json({ ok: true, data: cached.data, isFallback: true });
+        }
+        return res.status(503).json({
+          ok: false,
+          errorType: "NETWORK_ERROR",
+          message: "Temporary connection issue with Google Sheets. Please try again."
+        });
+      }
+
+      if (isTrueNotFound) {
+        // Legitimately not found in Google Sheets
+        cacheStore.delete(searchKey);
+        return res.json({ ok: false, notFound: true, message: "No examiner found." });
+      }
+
+      // If ambiguous message and we have cache, serve cache
+      if (cached) {
+        return res.json({ ok: true, data: cached.data, isFallback: true });
+      }
+
+      return res.json({ ok: false, message: data?.message || "No examiner found." });
+    }
+
     if (cached) {
-      console.log(`[Search] Serving stale cache as network fallback for ${searchKey}`);
       return res.json({ ok: true, data: cached.data, isFallback: true });
     }
-    return res.status(200).json({ 
+
+    return res.json({ ok: false, message: data?.message || "No examiner found." });
+  } catch (error: any) {
+    const isTimeout = axios.isAxiosError(error) && (error.code === 'ECONNABORTED' || String(error.message || '').includes('timeout'));
+    if (isTimeout) {
+      console.log(`[Search] Request for ${searchKey} reached timeout without match.`);
+      if (cached) {
+        return res.json({ ok: true, data: cached.data, isFallback: true });
+      }
+      return res.json({ ok: false, notFound: true, message: "No examiner found." });
+    }
+    console.log(`[Search] Live network event for ${searchKey}:`, error?.message || error);
+    if (cached) {
+      console.log(`[Search] Serving cached data as network fallback for ${searchKey}`);
+      return res.json({ ok: true, data: cached.data, isFallback: true });
+    }
+    // Return 503 so frontend knows it was a network timeout/glitch, NOT a missing record!
+    return res.status(503).json({ 
       ok: false, 
-      message: "No examiner found."
+      errorType: "NETWORK_ERROR",
+      message: "Temporary connection issue with Google Sheets. Please try again."
     });
   }
 });
